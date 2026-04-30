@@ -1,0 +1,18 @@
+httpx
+neo4j
+numpy
+typing_extensions>=4.13.0
+pydantic
+pydantic-settings
+loguru
+openai
+requests
+tqdm
+python-dotenv
+asyncio
+pytest
+# OCR dependencies
+pdf2image
+Pillow
+# PDF generation (HTML→PDF fallback for SEC EDGAR filings)
+weasyprint

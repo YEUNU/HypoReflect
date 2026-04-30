@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+vllm>=0.8.5
+transformers
+torch
+pydantic
+python-dotenv
