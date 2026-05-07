@@ -41,10 +41,10 @@ class RAGConfig:
     MAX_EMBEDDING_LENGTH = int(os.environ.get("MAX_EMBEDDING_LENGTH", "16384"))
     
     # --- RAG & Indexing Settings ---
-    MAX_CONCURRENT_LLM_CALLS = int(os.environ.get("MAX_CONCURRENT_LLM_CALLS", "10"))
-    EMBEDDING_BATCH_SIZE = int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE", "32"))
+    MAX_CONCURRENT_LLM_CALLS = int(os.environ.get("MAX_CONCURRENT_LLM_CALLS", "30"))
+    EMBEDDING_BATCH_SIZE = int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE", "128"))
     EMBEDDING_DIMENSIONS = int(os.environ.get("NEO4J_VECTOR_DIMENSIONS", "1024"))
-    NEO4J_BATCH_SIZE = int(os.environ.get("NEO4J_BATCH_SIZE", "10"))
+    NEO4J_BATCH_SIZE = int(os.environ.get("NEO4J_BATCH_SIZE", "25"))
     
     # --- Search & Ranking (RRF) ---
     RRF_K_CONSTANT = int(os.environ.get("RAG_RRF_K", "60"))
@@ -62,7 +62,7 @@ class RAGConfig:
     SIMILARITY_THRESHOLD = float(os.environ.get("RAG_SIMILARITY_THRESHOLD", "0.65"))
     HOP_DECAY = float(os.environ.get("RAG_HOP_DECAY", "0.85"))
     RERANKER_THRESHOLD = float(os.environ.get("RERANKER_THRESHOLD", "0.4"))
-    RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", "4"))
+    RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", "32"))
     RERANK_QUERY_MAX_TOKENS = int(os.environ.get("RERANK_QUERY_MAX_TOKENS", "256"))
     RERANK_DOC_MAX_TOKENS = int(os.environ.get("RERANK_DOC_MAX_TOKENS", "2800"))
     RERANK_OVERFLOW_DOC_MAX_TOKENS = int(os.environ.get("RERANK_OVERFLOW_DOC_MAX_TOKENS", "1800"))
