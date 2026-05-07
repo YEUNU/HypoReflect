@@ -6,6 +6,7 @@ import pytest
 
 from core.neo4j_service import Neo4jService
 from core.vllm_client import VLLMClient
+from models.hyporeflect.graphrag import GraphRAG
 from models.naive.naive_rag import NaiveRAG
 
 
@@ -153,6 +154,112 @@ async def test_live_naive_index_retrieve_roundtrip():
         assert nodes, "No nodes retrieved from live integration index."
         retrieved_blob = (context + "\n" + "\n".join(n.get("text", "") for n in nodes)).lower()
         assert unique_token.lower() in retrieved_blob
+    finally:
+        await _run_live_step("cleanup_after", cleanup(), timeout_seconds=20.0)
+        await Neo4jService.global_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_live_graphrag_index_retrieve_roundtrip():
+    """End-to-end smoke for the refactored GraphRAG facade.
+
+    Exercises every mixin in :mod:`models.hyporeflect.indexing` and
+    :mod:`models.hyporeflect.retrieval` against live Neo4j + vLLM:
+    ChunkingMixin (page parse + adaptive split + rolling ctx) ->
+    KnowledgeMappingMixin (Q-/Q+ generation via indexing_llm) ->
+    GraphWriterMixin (Neo4j MERGE + NEXT edges + index lifecycle) ->
+    HopEdgeMixin (offline HOP rerank if Q+ items pass quality gate) ->
+    RetrieveMixin (two-stage Q-/Q+ entry) -> HybridSearchMixin (RRF) ->
+    RerankMixin (cross-encoder + tau_r). The unique token must survive
+    indexing and resurface through retrieval.
+    """
+    await _require_live_services()
+
+    corpus_tag = "it_live_graph"
+    unique_token = "graphrag_live_unique_token_77403"
+    rag = GraphRAG(strategy="hyporeflect", corpus_tag=corpus_tag)
+
+    async def cleanup() -> None:
+        await rag.neo4j.execute_query(
+            f"MATCH (n:{rag.chunk_label}) DETACH DELETE n"
+        )
+        await rag.neo4j.execute_query(
+            f"MATCH (d:{rag.doc_label}) DETACH DELETE d"
+        )
+
+    async def wait_for_index_online() -> None:
+        for _ in range(20):
+            rows = await rag.neo4j.execute_query(
+                "SHOW VECTOR INDEXES YIELD name, state WHERE name = $name RETURN state",
+                {"name": rag.body_vector_index},
+            )
+            if rows and rows[0].get("state") == "ONLINE":
+                return
+            await asyncio.sleep(0.5)
+
+    await _run_live_step("cleanup_before", cleanup(), timeout_seconds=20.0)
+    try:
+        content = (
+            "Document: GraphRAG Live Smoke 10K\n"
+            "----- Page 1 -----\n"
+            f"In FY2022 the {unique_token} program produced disclosed metrics. "
+            f"Revenue attributable to {unique_token} was reported on the income statement. "
+            f"Capital expenditure for {unique_token} appeared on the cash flow statement. "
+            "These figures were audited as part of the consolidated financial statements.\n"
+        )
+        knowledge = await _run_live_step(
+            "extract_knowledge",
+            rag.extract_knowledge(content),
+            timeout_seconds=180.0,
+        )
+        assert knowledge.get("chunks"), "Adaptive chunking returned no chunks."
+        assert any(unique_token in c.get("text", "") for c in knowledge["chunks"]), (
+            "Unique token missing from generated chunks."
+        )
+
+        doc_id = await _run_live_step(
+            "create_document_node",
+            rag.create_document_node(
+                "graphrag_live_smoke.txt",
+                {"title": knowledge["title"]},
+            ),
+            timeout_seconds=20.0,
+        )
+        await _run_live_step(
+            "build_graph",
+            rag.build_graph(knowledge, source="graphrag_live_smoke.txt", document_filename=doc_id),
+            timeout_seconds=120.0,
+        )
+        await _run_live_step("flush_graph_batch", rag.flush_graph_batch(), timeout_seconds=120.0)
+        await _run_live_step("wait_for_index_online", wait_for_index_online(), timeout_seconds=30.0)
+
+        node_count = await _run_live_step(
+            "node_count",
+            rag.neo4j.execute_query(
+                f"MATCH (n:{rag.chunk_label}) RETURN count(n) AS c"
+            ),
+            timeout_seconds=20.0,
+        )
+        assert node_count and node_count[0].get("c", 0) > 0, "No GraphRAG nodes indexed."
+
+        context = ""
+        nodes = []
+        for _ in range(15):
+            context, nodes = await _run_live_step(
+                "retrieve",
+                rag.retrieve(f"{unique_token} revenue", top_k=3),
+                timeout_seconds=120.0,
+            )
+            if nodes:
+                break
+            await asyncio.sleep(1)
+
+        assert nodes, "GraphRAG retrieve returned no nodes."
+        retrieved_blob = (context + "\n" + "\n".join(n.get("text", "") for n in nodes)).lower()
+        assert unique_token.lower() in retrieved_blob, (
+            "Unique token not present in retrieved context."
+        )
     finally:
         await _run_live_step("cleanup_after", cleanup(), timeout_seconds=20.0)
         await Neo4jService.global_close()

@@ -232,3 +232,6 @@ data/hotpotqa_wiki_corpus
 data/enwiki-20171001-pages-meta-current-withlinks-abstracts.tar.bz2
 data/hotpot_dev_fullwiki_v1.json
 data/hotpotqa_queries.json
+
+# Local-only paper draft
+hyporeflect.pdf

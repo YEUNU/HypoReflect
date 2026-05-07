@@ -20,7 +20,7 @@ class RAGConfig:
         "EVAL_MODEL",
         os.environ.get("VLLM_SERVED_MODEL_NAME", "generation-model")
     )  # Default to local served model unless explicitly overridden.
-    HALLUCINATION_EVAL_MODEL = os.environ.get("HALLUCINATION_EVAL_MODEL", "gpt-5.2")
+    HALLUCINATION_EVAL_MODEL = os.environ.get("HALLUCINATION_EVAL_MODEL", "gpt-5.5-2026-04-23")
 
     # --- Per-stage model overrides (empty string = use DEFAULT_MODEL) ---
     # Supports local vLLM model names or OpenAI model names (gpt-*, o1-*, o3-*, o4-*)
@@ -48,8 +48,12 @@ class RAGConfig:
     
     # --- Search & Ranking (RRF) ---
     RRF_K_CONSTANT = int(os.environ.get("RAG_RRF_K", "60"))
-    RRF_VECTOR_WEIGHT = float(os.environ.get("RAG_RRF_VECTOR_WEIGHT", "1.0"))
-    RRF_TEXT_WEIGHT = float(os.environ.get("RAG_RRF_TEXT_WEIGHT", "1.2"))
+    # After the reranker fix (raw-string Qwen3-Reranker prompt) the vector
+    # channel actually carries semantic signal again; bumping vector above
+    # text restores the calibration we lost when the reranker collapsed to
+    # near-uniform scores.
+    RRF_VECTOR_WEIGHT = float(os.environ.get("RAG_RRF_VECTOR_WEIGHT", "1.3"))
+    RRF_TEXT_WEIGHT = float(os.environ.get("RAG_RRF_TEXT_WEIGHT", "1.0"))
     VECTOR_SEARCH_LIMIT = int(os.environ.get("RAG_VECTOR_SEARCH_LIMIT", "20"))
     TEXT_SEARCH_LIMIT = int(os.environ.get("RAG_TEXT_SEARCH_LIMIT", "20"))
     
@@ -57,7 +61,7 @@ class RAGConfig:
     HOP_THRESHOLD = float(os.environ.get("RAG_HOP_THRESHOLD", "0.82"))
     SIMILARITY_THRESHOLD = float(os.environ.get("RAG_SIMILARITY_THRESHOLD", "0.65"))
     HOP_DECAY = float(os.environ.get("RAG_HOP_DECAY", "0.85"))
-    RERANKER_THRESHOLD = float(os.environ.get("RERANKER_THRESHOLD", "0.5"))
+    RERANKER_THRESHOLD = float(os.environ.get("RERANKER_THRESHOLD", "0.4"))
     RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", "4"))
     RERANK_QUERY_MAX_TOKENS = int(os.environ.get("RERANK_QUERY_MAX_TOKENS", "256"))
     RERANK_DOC_MAX_TOKENS = int(os.environ.get("RERANK_DOC_MAX_TOKENS", "2800"))
@@ -85,10 +89,10 @@ class RAGConfig:
     MILESTONE_INTERVAL = int(os.environ.get("RAG_MILESTONE_INTERVAL", "5"))
     INDEXING_TEMPERATURE = float(os.environ.get("RAG_INDEXING_TEMPERATURE", "0.1"))
     MIN_CHUNK_SENTENCES = int(os.environ.get("RAG_MIN_CHUNK_SENTENCES", "2"))
-    HOP_LINK_LIMIT = int(os.environ.get("RAG_HOP_LINK_LIMIT", "3"))
+    HOP_LINK_LIMIT = int(os.environ.get("RAG_HOP_LINK_LIMIT", "5"))
     CONTEXT_FETCH_LIMIT = int(os.environ.get("RAG_CONTEXT_FETCH_LIMIT", "10"))
     GRAPH_SEARCH_LIMIT = int(os.environ.get("RAG_GRAPH_SEARCH_LIMIT", "10"))
-    DEFAULT_TOP_K = int(os.environ.get("RAG_DEFAULT_TOP_K", "5"))
+    DEFAULT_TOP_K = int(os.environ.get("RAG_DEFAULT_TOP_K", "8"))
     FULLTEXT_ANALYZER = os.environ.get("NEO4J_FULLTEXT_ANALYZER", "english")
     RECREATE_TEXT_INDEX = os.environ.get("RAG_RECREATE_TEXT_INDEX", "False").lower() == "true"
 
@@ -97,7 +101,7 @@ class RAGConfig:
     QUERY_REWRITE_COUNT = int(os.environ.get("RAG_QUERY_REWRITE_COUNT", "2"))
     QUERY_REWRITE_WEIGHT = float(os.environ.get("RAG_QUERY_REWRITE_WEIGHT", "0.85"))
     BOILERPLATE_PENALTY_WEIGHT = float(os.environ.get("RAG_BOILERPLATE_PENALTY_WEIGHT", "0.25"))
-    META_BOOST_WEIGHT = float(os.environ.get("RAG_META_BOOST_WEIGHT", "0.35"))
+    META_BOOST_WEIGHT = float(os.environ.get("RAG_META_BOOST_WEIGHT", "0.50"))
 
     # --- Benchmark Gate (Optional Quality Guardrail) ---
     BENCHMARK_GATE_ENABLED = os.environ.get("RAG_BENCHMARK_GATE", "False").lower() == "true"
@@ -112,6 +116,19 @@ class RAGConfig:
     ABLATION_ADAPTIVE_CHUNKING = os.environ.get("RAG_ABLATION_CHUNKING", "True").lower() == "true"
     ABLATION_ROLLING_SUMMARY = os.environ.get("RAG_ABLATION_SUMMARY", "True").lower() == "true"
     ENABLE_AGENT_REFLECTION = os.environ.get("RAG_ENABLE_REFLECTION", "True").lower() == "true"
+
+    # Predictive Knowledge Mapping channel ablations.
+    # ABLATION_Q_MINUS / ABLATION_Q_PLUS gate whether the Q-/Q+ channels
+    # participate in indexing (embedding storage) and retrieval (channel use).
+    # Disabling Q+ also disables offline HOP edge construction, since HOP
+    # selection is anchored on Q+ embeddings.
+    ABLATION_Q_MINUS = os.environ.get("RAG_ABLATION_Q_MINUS", "True").lower() == "true"
+    ABLATION_Q_PLUS = os.environ.get("RAG_ABLATION_Q_PLUS", "True").lower() == "true"
+
+    # HOP construction mode: "offline" pre-builds edges at indexing time
+    # (default, paper config). "runtime" skips offline HOP construction and
+    # expands the frontier via Q+ ANN + cross-encoder rerank at query time.
+    HOP_MODE = os.environ.get("RAG_HOP_MODE", "offline").strip().lower() or "offline"
 
     # --- Project Metadata ---
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

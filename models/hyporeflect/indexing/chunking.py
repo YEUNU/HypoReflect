@@ -1,3 +1,16 @@
+"""Adaptive Context-Aware Chunking with rolling context (paper §3.1.2).
+
+Two-level hierarchy:
+- Level 1 — page-level grouping by cosine similarity over page-summary embeddings
+  (threshold tau_page = 0.5 via RAGConfig.PAGE_SIMILARITY_THRESHOLD).
+- Level 2 — sentence-level adaptive splitting within each page cluster
+  (threshold tau_chunk = 0.65 via RAGConfig.SIMILARITY_THRESHOLD,
+   minimum sentences per chunk M_min = 2 via RAGConfig.MIN_CHUNK_SENTENCES).
+
+Each chunk is enriched with rolling context [anchor; milestone; prev-summary]
+before Q-/Q+ generation. The non-OCR table-to-text fallback also lives here
+because it operates inside the sentence iteration of Level 2.
+"""
 import asyncio
 import hashlib
 import json
@@ -11,9 +24,8 @@ import numpy as np
 from core.config import RAGConfig
 from utils.prompts import (
     GROUP_SUMMARY_PROMPT,
-    HOPRAG_FORMAT_INSTRUCTION,
-    HOPRAG_PROMPT,
     PAGE_SUMMARY_PROMPT,
+    TABLE_TO_TEXT_PROMPT,
 )
 
 
@@ -33,7 +45,7 @@ def _make_semantic_chunk_id(source, title, sent_id):
     return hashlib.md5(content_sig.encode()).hexdigest()
 
 
-class PipelineSupport:
+class ChunkingMixin:
     def _save_debug(self, doc_name: str, step: str, data: Any):
         doc_dir = os.path.join(self.debug_output_dir, doc_name.replace(" ", "_").replace("/", "_"))
         os.makedirs(doc_dir, exist_ok=True)
@@ -41,6 +53,43 @@ class PipelineSupport:
         with open(filepath, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2, default=str)
         logger.info("[DEBUG] Saved %s to %s", step, filepath)
+
+    async def _table_to_text(self, table_lines: list[str]) -> list[str]:
+        """Sentence-by-sentence rendering of a markdown-pipe table.
+
+        Used inside Level-2 sentence iteration when OCR'd input still contains
+        raw `|`-delimited table fragments. The OCR pipeline (§3.1.1) is the
+        primary table-to-text path; this is a fallback.
+        """
+        if not table_lines:
+            return []
+
+        if not RAGConfig.ABLATION_TABLE_TO_TEXT:
+            logger.info("Ablation: Skipping table-to-text conversion.")
+            return table_lines
+
+        table_text = "\n".join(table_lines)
+        prompt = TABLE_TO_TEXT_PROMPT + f"\nTABLE:\n{table_text}"
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.llm.generate_response(messages, apply_default_sampling=False)
+            converted = [sentence.strip() for sentence in response.split("\n") if sentence.strip()]
+            if not converted:
+                raise ValueError("Empty conversion result")
+            return converted
+        except Exception as error:
+            logger.warning("Table conversion failed (%s), using structured fallback", error)
+            fallback: list[str] = []
+            headers: list[str] = []
+            for line in table_lines:
+                cells = [cell.strip() for cell in line.split("|") if cell.strip()]
+                if not headers:
+                    headers = cells
+                else:
+                    pairs = [f"{header}: {value}" for header, value in zip(headers, cells) if value and value != "-"]
+                    if pairs:
+                        fallback.append(", ".join(pairs) + ".")
+            return fallback if fallback else table_lines
 
     async def extract_knowledge(self, content: str, source: str = "") -> dict[str, Any]:
         lines = content.split("\n")
@@ -83,6 +132,7 @@ class PipelineSupport:
             if not sentences:
                 return {"title": title, "chunks": []}
 
+        # ----- Level 1: page-level grouping (paper §3.1.2) -----
         if not RAGConfig.ABLATION_ADAPTIVE_CHUNKING:
             logger.info("Ablation: Using fixed page-based grouping (no adaptive similarity).")
             page_groups = []
@@ -167,6 +217,7 @@ class PipelineSupport:
             for index, group in enumerate(page_groups)
         ])
 
+        # ----- Level 2: sentence-level adaptive splitting + rolling context -----
         final_chunks = []
         global_sent_id = 0
         first_group_summary = page_groups[0].get("group_summary", "") if page_groups else ""
@@ -290,212 +341,3 @@ class PipelineSupport:
         ])
 
         return {"title": title, "chunks": final_chunks}
-
-    async def extract_hoprag_queries_with_rolling(self, chunk: str, title: str, running_summary: str) -> dict[str, Any]:
-        prompt_template = HOPRAG_PROMPT
-        text_prompt = prompt_template.format(
-            chunk=chunk,
-            global_context=f"Document: {title}. Previous context: {running_summary}",
-        )
-        messages = [{"role": "user", "content": text_prompt}, {"role": "user", "content": HOPRAG_FORMAT_INSTRUCTION}]
-        try:
-            data = await self.indexing_llm.generate_json(messages, apply_default_sampling=False)
-            return {
-                "q_minus": data.get("q_minus", []),
-                "q_plus": data.get("q_plus", []),
-                "summary": data.get("summary", ""),
-            }
-        except Exception as error:
-            logger.error("HopRAG extraction failed: %s", error)
-            return {"q_minus": [], "q_plus": [], "summary": ""}
-
-    async def build_graph(self, knowledge: dict[str, Any], source: str, document_filename: str):
-        await self._ensure_index_ready()
-
-        chunks = knowledge.get("chunks", [])
-        if not chunks:
-            return
-
-        body_texts = [str(chunk.get("text", "") or "") for chunk in chunks]
-        q_minus_texts = [
-            " ".join(self._dedupe_preserve_order([str(value or "") for value in chunk.get("q_minus", [])])).strip()
-            for chunk in chunks
-        ]
-
-        gated_q_plus_per_chunk: list[list[str]] = []
-        q_plus_texts: list[str] = []
-        for chunk in chunks:
-            raw_q_plus = self._dedupe_preserve_order([str(value or "") for value in chunk.get("q_plus", [])])
-            gated_q_plus = [
-                question for question in raw_q_plus
-                if self._is_high_quality_q_plus(
-                    question,
-                    str(chunk.get("title", "") or ""),
-                    str(chunk.get("text", "") or ""),
-                )
-            ]
-            gated_q_plus_per_chunk.append(gated_q_plus)
-            q_plus_texts.append(" ".join(gated_q_plus).strip())
-
-        body_embeds, q_minus_embeds, q_plus_embeds = await asyncio.gather(
-            self._embed_sparse_texts(body_texts),
-            self._embed_sparse_texts(q_minus_texts),
-            self._embed_sparse_texts(q_plus_texts),
-        )
-
-        batch_data = []
-        for index, chunk in enumerate(chunks):
-            body_embedding = body_embeds[index] if index < len(body_embeds) else []
-            q_minus_embedding = q_minus_embeds[index] if index < len(q_minus_embeds) else []
-            q_plus_embedding = q_plus_embeds[index] if index < len(q_plus_embeds) else []
-            q_plus_items = gated_q_plus_per_chunk[index] if index < len(gated_q_plus_per_chunk) else []
-
-            primary_embedding = q_minus_embedding if q_minus_embedding else body_embedding
-            if not primary_embedding:
-                logger.warning(
-                    "Skipping chunk with missing embedding: source=%s title=%s sent_id=%s",
-                    source,
-                    chunk.get("title", ""),
-                    chunk.get("sent_id", -1),
-                )
-                continue
-            chunk_id = _make_semantic_chunk_id(source, chunk["title"], chunk["sent_id"])
-            batch_data.append({
-                "id": chunk_id,
-                "text": chunk["text"],
-                "source": source,
-                "title": chunk["title"],
-                "sent_id": chunk["sent_id"],
-                "page": chunk.get("page", 0),
-                "embedding": primary_embedding,
-                "body_embedding": body_embedding if body_embedding else None,
-                "q_minus_embedding": q_minus_embedding if q_minus_embedding else None,
-                "q_plus_embedding": q_plus_embedding if q_plus_embedding and q_plus_items else None,
-                "q_minus_text": q_minus_texts[index] if index < len(q_minus_texts) else "",
-                "q_plus_text": q_plus_texts[index] if index < len(q_plus_texts) else "",
-                "q_plus": q_plus_items,
-                "q_plus_embed": q_plus_embedding if q_plus_embedding and q_plus_items else None,
-                "chunk_summary": chunk["summary"],
-            })
-
-        if not batch_data:
-            logger.warning("All chunks skipped for %s due to missing embeddings.", source)
-            return
-
-        async with self._batch_lock:
-            self._pending_batch.append({"data": batch_data, "doc_id": document_filename})
-            if len(self._pending_batch) >= RAGConfig.NEO4J_BATCH_SIZE:
-                await self._flush_graph_batch_unlocked()
-
-    async def flush_graph_batch(self):
-        async with self._batch_lock:
-            await self._flush_graph_batch_unlocked()
-
-    async def _find_hop_candidates(self, hop_src: dict[str, Any]) -> list[dict[str, Any]]:
-        if not hop_src.get("q_plus_embed"):
-            return []
-
-        query = f"""
-            CALL db.index.vector.queryNodes($index, 10, $embed)
-            YIELD node, score
-            WHERE node.id <> $src_id
-              AND node.source <> $src_source
-              AND node.q_plus_embedding IS NOT NULL
-            RETURN node.id as id, node.text as text, score
-        """
-        params = {
-            "index": self.q_plus_vector_index,
-            "embed": hop_src["q_plus_embed"],
-            "src_id": hop_src["id"],
-            "src_source": hop_src["source"],
-        }
-        results = await self.retry_query(query, params)
-        if results:
-            return results
-
-        fallback_query = f"""
-            CALL db.index.vector.queryNodes($index, 10, $embed)
-            YIELD node, score
-            WHERE node.id <> $src_id
-              AND node.source <> $src_source
-              AND node.q_minus_embedding IS NOT NULL
-            RETURN node.id as id, node.text as text, score
-        """
-        fallback_params = {
-            "index": self.q_minus_vector_index,
-            "embed": hop_src["q_plus_embed"],
-            "src_id": hop_src["id"],
-            "src_source": hop_src["source"],
-        }
-        return await self.retry_query(fallback_query, fallback_params)
-
-    async def _flush_graph_batch_unlocked(self):
-        if not self._pending_batch:
-            return
-
-        current_batch = self._pending_batch
-        self._pending_batch = []
-
-        for item in current_batch:
-            await self.retry_query(f"""
-                MATCH (d:{self.doc_label} {{filename: $doc_id}})
-                WITH d
-                UNWIND $batch AS item
-                MERGE (c:{self.chunk_label} {{id: item.id}})
-                SET c.text = item.text, c.source = item.source, c.title = item.title,
-                    c.sent_id = item.sent_id, c.page = item.page, c.corpus = $corpus,
-                    c.embedding = item.embedding,
-                    c.body_embedding = item.body_embedding, c.q_minus_embedding = item.q_minus_embedding,
-                    c.q_plus_embedding = item.q_plus_embedding, c.q_minus_text = item.q_minus_text,
-                    c.q_plus_text = item.q_plus_text, c.chunk_summary = item.chunk_summary
-                MERGE (d)-[:CONTAINS]->(c)
-            """, {"batch": item["data"], "doc_id": item["doc_id"], "corpus": self.corpus_tag})
-
-            await self.retry_query(f"""
-                UNWIND range(0, size($batch)-2) AS i
-                MATCH (c1:{self.chunk_label} {{id: $batch[i].id}})
-                MATCH (c2:{self.chunk_label} {{id: $batch[i+1].id}})
-                MERGE (c1)-[:NEXT]->(c2)
-            """, {"batch": item["data"]})
-
-        all_hop_edges = []
-        for item in current_batch:
-            batch_data = item["data"]
-            hop_items = [batch_item for batch_item in batch_data if batch_item.get("q_plus_embed") is not None]
-
-            for hop_src in hop_items:
-                candidates = await self._find_hop_candidates(hop_src)
-                if not candidates:
-                    continue
-
-                q_plus_text = " ".join(hop_src.get("q_plus", []))
-                cand_texts = [candidate["text"] for candidate in candidates]
-
-                try:
-                    scores = await self.llm.rerank(q_plus_text, cand_texts, instruction=self._reranker_instruction())
-
-                    valid_edges = []
-                    for index, score in enumerate(scores):
-                        if score >= RAGConfig.RERANKER_THRESHOLD:
-                            valid_edges.append({
-                                "src_id": hop_src["id"],
-                                "tgt_id": candidates[index]["id"],
-                                "score": score,
-                            })
-
-                    valid_edges = sorted(valid_edges, key=lambda item: item["score"], reverse=True)[:RAGConfig.HOP_LINK_LIMIT]
-                    all_hop_edges.extend(valid_edges)
-                except Exception as error:
-                    logger.warning("Reranking for HOP edges failed: %s", error)
-
-        if all_hop_edges:
-            await self.retry_query(f"""
-                UNWIND $edges AS edge
-                MATCH (src:{self.chunk_label} {{id: edge.src_id}})
-                MATCH (tgt:{self.chunk_label} {{id: edge.tgt_id}})
-                MERGE (src)-[r:HOP]->(tgt)
-                SET r.score = edge.score, r.type = 'pruned'
-            """, {"edges": all_hop_edges})
-
-    async def _build_graph_tx(self, tx, batch, doc_id):
-        pass

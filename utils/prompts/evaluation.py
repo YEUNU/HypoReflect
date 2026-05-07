@@ -31,12 +31,16 @@ FINANCEBENCH_JUDGE_PROMPT = """
 **Model Prediction:** {response}
 
 ### Instructions:
-1. Compare the Model Prediction with the Ground Truth Answer.
+1. The Model Prediction may contain step-by-step reasoning. Locate the FINAL answer:
+   it is typically enclosed in \\boxed{{...}}, follows "Final Answer:", or follows the
+   last "@@ANSWER:" marker. Compare ONLY that final answer against the Ground Truth
+   — ignore intermediate reasoning steps and worked-out arithmetic.
 2. Financial values must match numerically; equivalent unit scaling (million/billion/M) and formatting differences ($, commas, %) are acceptable.
-3. If the Model Prediction provides the correct factual/financial information as the Ground Truth, score it 1.0 (CORRECT).
-4. If the Model Prediction is factually wrong, contradicts the Ground Truth, or provides an incorrect value, score it 0.0 (INCORRECT).
+3. If the final answer provides the correct factual/financial information as the Ground Truth, score it 1.0 (CORRECT).
+4. If the final answer is factually wrong, contradicts the Ground Truth, or provides an incorrect value, score it 0.0 (INCORRECT).
 5. Minor wording differences are okay as long as the core answer is the same.
 6. If the question does not specify precision, treat equivalent values under standard rounding as correct.
+7. Treat "Insufficient evidence." (or equivalent abstention) as 0.0 only when the Ground Truth contains a substantive answer; if the Ground Truth itself reflects "no value / 0 / not disclosed", an abstention may be acceptable.
 
 Respond ONLY in JSON format:
 {{"score": 1.0 or 0.0, "reason": "brief explanation"}}
@@ -50,10 +54,12 @@ FINANCEBENCH_HALLUCINATION_PROMPT = """
 **Model Prediction:** {response}
 
 ### Instructions:
-1. Judge hallucination by comparing Model Prediction with Ground Truth.
-2. Return hallucination=1.0 if the prediction asserts wrong/conflicting factual or numeric content.
-3. Return hallucination=0.0 if the prediction is factually consistent with the Ground Truth.
-4. If prediction is exactly "insufficient evidence" (or equivalent non-answer), return hallucination=0.0.
+1. The Model Prediction may contain step-by-step reasoning. Locate the FINAL answer
+   (\\boxed{{...}}, after "Final Answer:", or after the last "@@ANSWER:") and judge
+   hallucination on that final answer only.
+2. Return hallucination=1.0 if the final answer asserts wrong/conflicting factual or numeric content.
+3. Return hallucination=0.0 if the final answer is factually consistent with the Ground Truth.
+4. If the final answer is exactly "insufficient evidence" (or equivalent non-answer), return hallucination=0.0.
 5. Allow equivalent unit scaling/format differences when values are the same.
 
 Respond ONLY in JSON format:

@@ -13,7 +13,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from cli.benchmark import run_benchmark
 from cli.index import run_indexing
-from cli.ocr import run_ocr
+from models.hyporeflect.indexing.ocr import run_ocr
 from core.neo4j_service import Neo4jService
 from core.vllm_client import VLLMClient
 from utils.io import get_sample_companies

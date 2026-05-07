@@ -8,6 +8,10 @@ set -e
 
 # [환경 설정]
 export VLLM_API_KEY="${VLLM_API_KEY:-EMPTY}"
+# Ensure nvcc is on PATH for FlashInfer JIT compilation.
+if [ -d "/usr/local/cuda-12.8/bin" ]; then
+    export PATH="/usr/local/cuda-12.8/bin:$PATH"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -169,12 +173,12 @@ start_gen() {
     fi
 
     echo "Starting Generation Server (Port 28000)..."
-    CUDA_VISIBLE_DEVICES=0 nohup .venv/bin/vllm serve Qwen/Qwen3-4B-Instruct-2507 \
+    CUDA_VISIBLE_DEVICES=1 nohup .venv/bin/vllm serve Qwen/Qwen3-4B-Instruct-2507 \
         --served-model-name generation-model \
         --host 0.0.0.0 \
         --port 28000 \
-        --gpu-memory-utilization 0.8 \
-        --max-model-len 65536 \
+        --gpu-memory-utilization 0.55 \
+        --max-model-len 32768 \
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_xml \
         --attention-backend FLASHINFER \
@@ -198,7 +202,7 @@ start_ocr() {
         --served-model-name ocr-model \
         --host 0.0.0.0 \
         --port 28001 \
-        --gpu-memory-utilization 0.4 \
+        --gpu-memory-utilization 0.85 \
         --max-model-len 8192 \
         --attention-backend FLASHINFER \
         --trust-remote-code \
@@ -218,11 +222,11 @@ start_embed() {
     fi
 
     echo "Starting Embedding Server (Port 18082)..."
-    CUDA_VISIBLE_DEVICES=1 nohup .venv/bin/vllm serve Qwen/Qwen3-Embedding-0.6B \
+    CUDA_VISIBLE_DEVICES=0 nohup .venv/bin/vllm serve Qwen/Qwen3-Embedding-0.6B \
         --served-model-name embedding-model \
         --host 0.0.0.0 \
         --port 18082 \
-        --gpu-memory-utilization 0.45 \
+        --gpu-memory-utilization 0.40 \
         --max-model-len 16384 \
         --attention-backend FLASHINFER \
         --trust-remote-code > embedding.log 2>&1 &
@@ -242,7 +246,7 @@ start_rerank() {
     echo "Starting Reranker Service (Port 18083)..."
     export RERANKER_MODEL_ID="Qwen/Qwen3-Reranker-0.6B"
     export RERANKER_GPU_ID=1
-    export RERANKER_GPU_UTIL=0.4
+    export RERANKER_GPU_UTIL=0.25
     export RERANKER_MAX_MODEL_LEN=4096
     export RERANKER_ATTENTION_BACKEND="FLASHINFER"
     nohup .venv/bin/uvicorn third_party.backend_reranker.main:app --host 0.0.0.0 --port 18083 > reranker.log 2>&1 &

@@ -1,3 +1,10 @@
+"""Topology-Preserving OCR runner (paper §3.1.1).
+
+VLM OCR step that renders financial tables as Markdown to preserve
+row-column topology, preventing value-context dissociation that occurs
+with plain-text flattening. Outputs both raw page metadata (.json) and
+concatenated text (.txt) under output_dir/{raw,text}.
+"""
 import asyncio
 import json
 import logging

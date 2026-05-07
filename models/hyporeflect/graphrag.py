@@ -1,3 +1,10 @@
+"""GraphRAG facade composing the offline indexing pipeline (paper §3.1) and
+the query-time retrieval pipeline (paper §3.2.3).
+
+All Neo4j labels and index names are derived from (strategy, corpus_tag) so
+multiple corpora and strategies coexist in the same database without
+collision (CLAUDE.md "Neo4j corpus isolation").
+"""
 import asyncio
 import logging
 import re
@@ -6,20 +13,14 @@ from typing import Optional
 from core.config import RAGConfig
 from core.neo4j_service import Neo4jService
 from core.vllm_client import VLLMClient, get_llm_client
-from utils.prompts import RERANKER_INSTRUCTION
-from models.hyporeflect.graphrag_parts import (
-    IndexingSupport,
-    PipelineSupport,
-    QuerySupport,
-    RetrievalSupport,
-    TextProcessingSupport,
-)
+from models.hyporeflect.indexing import IndexingPipeline
+from models.hyporeflect.retrieval import RetrievalPipeline
 
 
 logger = logging.getLogger(__name__)
 
 
-class GraphRAG(TextProcessingSupport, QuerySupport, IndexingSupport, RetrievalSupport, PipelineSupport):
+class GraphRAG(IndexingPipeline, RetrievalPipeline):
     def __init__(
         self,
         strategy: str = "hyporeflect",
@@ -60,7 +61,3 @@ class GraphRAG(TextProcessingSupport, QuerySupport, IndexingSupport, RetrievalSu
         self._index_setup_lock = asyncio.Lock()
         self.debug_output_dir = f"data/debug/{self.corpus_tag}"
         self.save_intermediate = save_intermediate
-
-    @staticmethod
-    def _reranker_instruction() -> str:
-        return RERANKER_INSTRUCTION

@@ -3,8 +3,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.config import RAGConfig
-from models.hyporeflect.agent_service import AgentService, AgentState, ExecutionHandler, ReflectionHandler
-from models.hyporeflect.stages.execution import ExpansionLoopState
+from models.hyporeflect.service import AgentService
+from models.hyporeflect.state import AgentState
+from models.hyporeflect.stages.execution import ExecutionHandler, ExpansionLoopState
+from models.hyporeflect.stages.reflection import ReflectionHandler
 
 
 def test_compute_missing_slots_from_ledger():
@@ -1549,7 +1551,7 @@ def test_prefer_refined_candidate_allows_insufficient_rollback_when_issues_impro
     state = AgentState("Q", [])
     state.query_state = {"missing_data_policy": "insufficient"}
 
-    keep_after, quality = service._prefer_refined_candidate(  # noqa: SLF001
+    keep_after, quality = service._orchestrator.refinement_loop._prefer_refined_candidate(  # noqa: SLF001
         state=state,
         before_answer="@@ANSWER: yes [[DOC_A, Page 1, Chunk 1]]",
         before_passed=False,
@@ -1573,7 +1575,7 @@ def test_prefer_refined_candidate_keeps_grounded_when_before_passed():
     state = AgentState("Q", [])
     state.query_state = {"missing_data_policy": "insufficient"}
 
-    keep_after, quality = service._prefer_refined_candidate(  # noqa: SLF001
+    keep_after, quality = service._orchestrator.refinement_loop._prefer_refined_candidate(  # noqa: SLF001
         state=state,
         before_answer="@@ANSWER: yes [[DOC_A, Page 1, Chunk 1]]",
         before_passed=True,
@@ -1599,7 +1601,7 @@ def test_prefer_refined_candidate_blocks_inapplicable_policy_insufficient_rollba
     state.missing_slots = [{"metric": "quick ratio"}]
     state.context = "[[DOC_A, Page 1, Chunk 1]]\nQuick ratio section"
 
-    keep_after, quality = service._prefer_refined_candidate(  # noqa: SLF001
+    keep_after, quality = service._orchestrator.refinement_loop._prefer_refined_candidate(  # noqa: SLF001
         state=state,
         before_answer="@@ANSWER: no [[DOC_A, Page 1, Chunk 1]]",
         before_passed=False,
@@ -1648,171 +1650,12 @@ async def test_run_refinement_loop_restores_reflection_meta_on_rollback():
 
     service.refinement.run = AsyncMock(side_effect=_mock_refinement_run)
     service.reflection.run = AsyncMock(side_effect=_mock_reflection_run)
-    service._prefer_refined_candidate = MagicMock(return_value=(False, {"reason": "forced_rollback"}))  # noqa: SLF001
+    service._orchestrator.refinement_loop._prefer_refined_candidate = MagicMock(return_value=(False, {"reason": "forced_rollback"}))  # noqa: SLF001
 
-    await service._run_refinement_loop(state, reflection_passed=False)  # noqa: SLF001
+    await service._orchestrator.refinement_loop.run_loop(state, reflection_passed=False)  # noqa: SLF001
 
     assert state.final_answer == "@@ANSWER: insufficient evidence"
     assert state.reflection_meta == before_meta
-
-
-def test_build_operating_margin_driver_override_answer_returns_grounded_driver_summary():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    state = AgentState("What drove operating margin change as of FY2022 for 3M?", [])
-    state.query_state = {
-        "answer_type": "extract",
-        "metric": "operating margin",
-        "missing_data_policy": "inapplicable_explain",
-    }
-    state.missing_slots = [{"metric": "operating margin change drivers"}]
-    state.evidence_ledger = []
-    state.context = (
-        "[[3M_2022_10K, Page 23, Chunk 111]]\n"
-        "Year ended December 31, 2021 GAAP: Total Company was $7,369, with a margin of 20.8%. "
-        "Year ended December 31, 2022 GAAP: Total Company was $6,539, with a margin of 19.1%. "
-        "Adjustments included decrease in gross margin, significant litigation primarily related to "
-        "Combat Arms Earplugs litigation, PFAS manufacturing exit costs, Russia exit charges, and "
-        "divestiture-related restructuring actions."
-    )
-    state.all_context_data = []
-
-    answer = handler._build_operating_margin_driver_override_answer(state)  # noqa: SLF001
-
-    assert answer is not None
-    assert "1.7%" in answer
-    assert "Combat Arms Earplugs" in answer
-    assert "[[3M_2022_10K, Page 23, Chunk 111]]" in answer
-
-
-def test_build_segment_drag_override_answer_returns_consumer_segment():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    state = AgentState("If we exclude the impact of M&A, which segment has dragged down growth?", [])
-    state.query_state = {
-        "answer_type": "extract",
-        "metric": "organic sales change by business segment excluding acquisitions/divestitures",
-        "missing_data_policy": "insufficient",
-    }
-    state.missing_slots = []
-    state.evidence_ledger = []
-    state.context = (
-        "[[3M_2022_10K, Page 30, Chunk 169]]\n"
-        "Sales (millions) in Consumer Business: Organic sales were (0.9) % in 2022."
-    )
-    state.all_context_data = []
-
-    answer = handler._build_segment_drag_override_answer(state)  # noqa: SLF001
-
-    assert answer is not None
-    assert "Consumer" in answer
-    assert "0.9%" in answer
-    assert "[[3M_2022_10K, Page 30, Chunk 169]]" in answer
-
-
-def test_build_quick_ratio_health_override_answer_returns_no():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    state = AgentState(
-        "Does 3M have a reasonably healthy liquidity profile based on its quick ratio for Q2 of FY2023?",
-        [],
-    )
-    state.query_state = {
-        "answer_type": "boolean",
-        "metric": "quick ratio",
-        "missing_data_policy": "inapplicable_explain",
-    }
-    state.missing_slots = []
-    state.evidence_ledger = []
-    state.context = (
-        "[[3M_2023Q2_10Q, Page 4, Chunk 21]]\n"
-        "Management notes that the quick ratio for June 30, 2023 was 0.96."
-    )
-    state.all_context_data = []
-
-    answer = handler._build_quick_ratio_health_override_answer(state)  # noqa: SLF001
-
-    assert answer is not None
-    assert answer.startswith("@@ANSWER: No")
-    assert "0.96x" in answer
-    assert "[[3M_2023Q2_10Q, Page 4, Chunk 21]]" in answer
-
-
-def test_build_debt_securities_override_answer_returns_exchange_list():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    state = AgentState(
-        "Which debt securities are registered to trade on a national securities exchange under 3M's name as of Q2 of 2023?",
-        [],
-    )
-    state.query_state = {
-        "answer_type": "list",
-        "metric": "debt securities registered to trade on a national securities exchange under 3m's name",
-        "missing_data_policy": "insufficient",
-    }
-    state.missing_slots = []
-    state.evidence_ledger = []
-    state.context = (
-        "[[3M_2022_10K, Page 1, Chunk 3]]\n"
-        "Securities registered pursuant to Section 12(b) of the Act: "
-        "Title of each class: 1.750% Notes due 2030, Trading Symbol(s): MMM26, "
-        "Name of each exchange on which registered: New York Stock Exchange "
-        "Title of each class: 1.500% Notes due 2031, Trading Symbol(s): MMM30, "
-        "Name of each exchange on which registered: New York Stock Exchange "
-        "Title of each class: , Trading Symbol(s): MMM31, "
-        "Name of each exchange on which registered: New York Stock Exchange"
-    )
-    state.all_context_data = []
-
-    answer = handler._build_debt_securities_override_answer(state)  # noqa: SLF001
-
-    assert answer is not None
-    assert "MMM26" in answer
-    assert "MMM30" in answer
-    assert "MMM31" in answer
-    assert "[[3M_2022_10K, Page 1, Chunk 3]]" in answer
-
-
-def test_build_capital_intensity_override_answer_returns_no_when_ratio_is_low():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    state = AgentState("Is 3M a capital-intensive business based on FY2022 data?", [])
-    state.query_state = {
-        "answer_type": "boolean",
-        "metric": "capital intensity",
-        "missing_data_policy": "insufficient",
-    }
-    state.missing_slots = []
-    state.evidence_ledger = [
-        {
-            "slot": {
-                "entity": "3m",
-                "period": "fy2022",
-                "metric": "capital expenditures",
-                "source_anchor": "cash flow statement",
-            },
-            "value": "1,749",
-            "citation": "[[3M_2022_10K, Page 40, Chunk 235]]",
-        },
-        {
-            "slot": {
-                "entity": "3m",
-                "period": "fy2022",
-                "metric": "revenue",
-                "source_anchor": "income statement",
-            },
-            "value": "34,229",
-            "citation": "[[3M_2022_10K, Page 48, Chunk 269]]",
-        },
-    ]
-    state.context = (
-        "[[3M_2022_10K, Page 40, Chunk 235]]\n"
-        "Purchases of property, plant and equipment was (1,749) in 2022.\n\n"
-        "[[3M_2022_10K, Page 48, Chunk 269]]\n"
-        "Net sales were $34,229 million in 2022."
-    )
-
-    answer = handler._build_capital_intensity_override_answer(state)  # noqa: SLF001
-
-    assert answer is not None
-    assert answer.startswith("@@ANSWER: No")
-    assert "[[3M_2022_10K, Page 40, Chunk 235]]" in answer
-    assert "[[3M_2022_10K, Page 48, Chunk 269]]" in answer
 
 
 def test_extract_primary_financial_number_ignores_company_token_number():
@@ -1934,111 +1777,6 @@ def test_verify_answer_grounding_rejects_non_compute_citation_outside_context():
 
     assert ok is False
     assert "citation not present in context" in reason
-
-
-def test_build_dividend_stability_override_answer_returns_yes():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    state = AgentState("Does 3M maintain a stable trend of dividend distribution?", [])
-    state.query_state = {
-        "answer_type": "boolean",
-        "metric": "dividend distribution",
-        "missing_data_policy": "insufficient",
-    }
-    state.context = (
-        "[[3M_2023Q2_10Q, Page 73, Chunk 450]]\n"
-        "3M has paid dividends since 1916. This marked the 65th consecutive year of dividend increases."
-    )
-    state.evidence_ledger = []
-    state.missing_slots = [{"metric": "dividend distribution"}]
-    state.all_context_data = []
-
-    answer = handler._build_dividend_stability_override_answer(state)  # noqa: SLF001
-
-    assert answer is not None
-    assert answer.startswith("@@ANSWER: Yes")
-    assert "[[3M_2023Q2_10Q, Page 73, Chunk 450]]" in answer
-
-
-@pytest.mark.asyncio
-async def test_run_workflow_applies_post_refinement_capital_intensity_override():
-    service = AgentService(
-        model_id="local",
-        strategy="hyporeflect",
-        llm_override=MagicMock(),
-        grag_override=MagicMock(),
-    )
-
-    async def _mock_execution_run(state):
-        state.query_state = {
-            "answer_type": "boolean",
-            "metric": "capital intensity",
-            "missing_data_policy": "insufficient",
-        }
-        state.final_answer = "@@ANSWER: insufficient evidence"
-        state.context = ""
-        state.evidence_ledger = []
-        state.missing_slots = []
-        state.all_context_data = []
-
-    service.perception.run = AsyncMock(return_value=None)
-    service.planning.run = AsyncMock(return_value=None)
-    service.execution.run = AsyncMock(side_effect=_mock_execution_run)
-    service.reflection.run = AsyncMock(return_value=False)
-    service._run_refinement_loop = AsyncMock(return_value=False)  # noqa: SLF001
-    service.execution._build_capital_intensity_override_answer = MagicMock(  # noqa: SLF001
-        return_value="@@ANSWER: No, ratio is low [[DOC_A, Page 1, Chunk 1]]"
-    )
-
-    answer, _, trace = await service.run_workflow("Is 3M a capital-intensive business?")
-
-    assert answer.startswith("@@ANSWER: No")
-    assert any(
-        isinstance(item, dict) and item.get("step") == "service_post_refinement_override"
-        for item in trace
-    )
-
-
-@pytest.mark.asyncio
-async def test_run_workflow_applies_post_refinement_dividend_override():
-    service = AgentService(
-        model_id="local",
-        strategy="hyporeflect",
-        llm_override=MagicMock(),
-        grag_override=MagicMock(),
-    )
-
-    async def _mock_execution_run(state):
-        state.query_state = {
-            "answer_type": "boolean",
-            "metric": "dividend distribution",
-            "missing_data_policy": "insufficient",
-        }
-        state.final_answer = "@@ANSWER: insufficient evidence"
-        state.context = ""
-        state.evidence_ledger = []
-        state.missing_slots = []
-        state.all_context_data = []
-
-    service.perception.run = AsyncMock(return_value=None)
-    service.planning.run = AsyncMock(return_value=None)
-    service.execution.run = AsyncMock(side_effect=_mock_execution_run)
-    service.reflection.run = AsyncMock(return_value=False)
-    service._run_refinement_loop = AsyncMock(return_value=False)  # noqa: SLF001
-    service.execution._build_capital_intensity_override_answer = MagicMock(return_value=None)  # noqa: SLF001
-    service.execution._build_dividend_stability_override_answer = MagicMock(  # noqa: SLF001
-        return_value="@@ANSWER: Yes, stable dividends [[DOC_A, Page 1, Chunk 1]]"
-    )
-
-    answer, _, trace = await service.run_workflow("Does 3M maintain a stable trend of dividend distribution?")
-
-    assert answer.startswith("@@ANSWER: Yes")
-    assert any(
-        isinstance(item, dict)
-        and item.get("step") == "service_post_refinement_override"
-        and isinstance(item.get("output"), dict)
-        and item.get("output", {}).get("reason") == "dividend_stability_rule"
-        for item in trace
-    )
 
 
 @pytest.mark.asyncio

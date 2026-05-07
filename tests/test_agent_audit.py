@@ -1,7 +1,8 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from models.hyporeflect.agent_service import AgentService, AgentState
+from models.hyporeflect.service import AgentService
+from models.hyporeflect.state import AgentState
 
 @pytest.mark.asyncio
 async def test_agent_loop_audit():

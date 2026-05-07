@@ -1,15 +1,25 @@
 HOPRAG_PROMPT = """
 Analyze this financial document chunk and generate hypothetical questions to enable multi-hop reasoning.
+
+Definitions (paper §3.1.3 — keep them strictly distinct):
+- Q- (Incoming, self-contained): questions that THIS CHUNK ALONE answers verbatim. Used to retrieve this chunk when a user query asks for a fact already on the page.
+- Q+ (Outgoing dependency / Bridge): questions that POINT OUTWARD from this chunk — they reference an entity, period, or metric grounded here, but the answer ALSO REQUIRES information from a different chunk or document. The Q+ question is the missing counterpart that another chunk would supply. Q+ is what builds the multi-hop graph; it is NOT a paraphrase of Q-.
+
 Rules:
-1. Q- (Incoming): up to 3 questions that this chunk directly answers; use [] if the chunk lacks concrete answerable facts.
-2. Q+ (Bridge): up to 3 follow-up questions that remain grounded in this chunk but need other chunks/docs; use [] if no high-quality bridge question exists.
-3. Every produced question must be specific, answerable, and <= 22 words.
-4. Every produced question must include at least one entity token and one metric/line-item token that appear in this chunk.
-5. If a year/period token exists in this chunk, include it in each question.
+1. Q-: up to 3 self-contained questions this chunk directly answers; use [] if the chunk lacks concrete answerable facts.
+2. Q+: up to 3 outward-dependency questions. Each Q+ MUST satisfy at least one of:
+   (a) ask about the SAME metric in a DIFFERENT period than the one(s) shown here;
+   (b) ask about a DERIVED metric (margin, ratio, growth, YoY change, average, FCF, ROA, ROE) whose primitive operands are NOT all present in this chunk;
+   (c) ask about a RELATED LINE ITEM in a DIFFERENT statement (e.g., this chunk shows revenue → ask the cash-flow counterpart, this chunk shows net income → ask the balance-sheet counterpart);
+   (d) ask about a MULTI-DOC bridge (e.g., compare to a prior-year filing, or to a segment break-down referenced in notes).
+   If none of (a)-(d) apply, leave Q+ empty rather than emit a Q- duplicate.
+3. Every produced question must be specific, answerable in finite SEC-filing context, and <= 22 words.
+4. Each question SHOULD include grounding tokens (entity / metric / period / source anchor) that appear in this chunk; aim for at least two of these signals per question to keep the question retrievable.
+5. If a year/period token exists in this chunk, include it in each Q-; for Q+ a different period token is allowed (in fact preferred for type (a)).
 6. Never use placeholders/meta phrases such as "document anchor", "what does the balance sheet show", or lists like "(balance sheet, income statement, cash flow statement, note table)".
 7. Never fabricate unseen values, dates, entities, policies, or legal details.
 8. If this chunk is mostly TOC/exhibits/signatures/boilerplate or numeric fragments with weak context, return shorter lists (or empty lists) rather than low-quality questions.
-9. If the chunk contains computation cues (change, increase/decrease, ratio, margin, versus/prior period, multi-period values), produce at least 1 Q+ targeting the missing counterpart operand/period.
+9. If the chunk contains computation cues (change, increase/decrease, ratio, margin, versus/prior period, multi-period values), produce at least 1 Q+ of type (a) or (b).
 10. Dense Summary: exactly 1 sentence, maximum 35 words, grounded only in this chunk; preserve numeric strings exactly when present.
 
 GLOBAL CONTEXT: {global_context}
@@ -30,7 +40,7 @@ Rules:
 3. Every variant must include the same target company/entity token(s) and target period token(s) when present; if they cannot be preserved, do not emit that variant.
 4. Keep metric, numeric qualifiers, and formula definition unchanged.
 5. Preserve exact tokens for symbols/segments/line items when present (e.g., MMM26, consumer segment).
-6. Each variant must include at least one statement anchor term (balance sheet, income statement, cash flow statement, note table, PP&E, accounts receivable, inventory, debt securities).
+6. When the original query references or implies a financial statement (balance sheet, income statement, cash flow statement, note table, PP&E, accounts receivable, inventory, debt securities), include that anchor term in at least one variant. For yes/no, definitional, or qualitative queries that do not involve a specific statement, omit the anchor rather than fabricating one.
 7. Apply filing synonym normalization only when equivalent:
    - revenue ↔ net sales
    - capex ↔ purchases of property, plant and equipment (PP&E)
@@ -57,12 +67,11 @@ Output ONLY JSON:
 """
 
 RERANKER_INSTRUCTION = (
-    "Given a finance QA query, rank passages from SEC filings by direct answerability. "
-    "Hard constraints: prioritize passages matching the exact target company/entity and year/period; strongly penalize company/period mismatches. "
-    "Prefer primary financial statements and note tables containing required line items or formula operands. "
-    "For extraction/list questions, prioritize passages that explicitly contain exact target tokens (symbols, segment names, note titles). "
-    "Treat standard synonyms as equivalent (revenue=net sales, capex=purchases of PP&E, net PP&E=property plant and equipment net). "
-    "Down-rank boilerplate legal/risk/exhibit text unless explicitly requested."
+    "Rank the passage by whether it directly answers the query. "
+    "Match the exact entity and period in the query; reject entity or period mismatches. "
+    "Prefer primary statements and note tables that contain the requested line item. "
+    "Treat revenue=net sales, capex=PP&E purchases, net PP&E=property plant and equipment net. "
+    "Down-rank boilerplate."
 )
 
 RERANKER_INSTRUCTION_GENERIC = (

@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from core.config import RAGConfig
 from core.vllm_client import get_llm_client
-from models.hyporeflect.agent_service import AgentService
+from models.hyporeflect.service import AgentService
 from models.naive.naive_rag import NaiveRAG
 from utils.io import _safe_float
 from utils.metrics import evaluate_financebench_response
@@ -21,6 +21,29 @@ logger = logging.getLogger("HypoReflect")
 
 def _as_lower_text(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+_BOXED_RE = re.compile(r"\\boxed\{([^{}]+(?:\{[^{}]*\}[^{}]*)*)\}")
+_FINAL_LABEL_RE = re.compile(
+    r"(?is)(?:final\s+answer|@@ANSWER|answer)\s*:?\s*(.+?)(?:\n\n|\Z)"
+)
+
+
+def _extract_final_answer(answer_text: str) -> str:
+    """Extract the final answer from a model response that may contain
+    step-by-step reasoning. Order: \\boxed{...} > 'Final Answer:' marker >
+    last 300 chars. Avoids substring-matching the reasoning body for
+    abstain detection.
+    """
+    if not answer_text:
+        return ""
+    boxed = _BOXED_RE.findall(answer_text)
+    if boxed:
+        return boxed[-1].strip()
+    matches = _FINAL_LABEL_RE.findall(answer_text)
+    if matches:
+        return matches[-1].strip()[:400]
+    return answer_text[-300:].strip()
 
 
 def _is_multiple_choice_query(item: dict[str, Any]) -> bool:
@@ -65,22 +88,22 @@ def _is_math_query(item: dict[str, Any]) -> bool:
 
 
 def _build_benchmark_query(query: str, item: dict[str, Any]) -> str:
-    extra_instructions: list[str] = []
-    if _is_math_query(item):
-        extra_instructions.append(BENCHMARK_MATH_FORMAT_INSTRUCTION)
-    if _is_multiple_choice_query(item):
-        extra_instructions.append(BENCHMARK_MCQ_JSON_FORMAT_INSTRUCTION)
+    """Return the user-facing query as-is.
 
-    if not extra_instructions:
-        return query
+    The previous implementation appended `[Benchmark Output Format]` blocks
+    instructing the model to produce step-by-step CoT inside `\\boxed{}`. That
+    suffix (a) leaked into retrieval embeddings as noise, (b) forced verbose
+    reasoning that doubled latency, and (c) collided with the citation-first
+    answer format expected by `simple_answer_prompt`. The judge prompt now
+    handles `\\boxed{}` / "Final Answer:" extraction internally, so emitting
+    that scaffolding upstream provides no signal — only confounds.
 
-    existing = _as_lower_text(query)
-    deduped = [inst for inst in extra_instructions if _as_lower_text(inst) not in existing]
-    if not deduped:
-        return query
-
-    instruction_block = "\n".join(f"- {inst}" for inst in deduped)
-    return f"{query}\n\n[Benchmark Output Format]\n{instruction_block}"
+    Math/MCQ format instructions are kept available as constants but are not
+    injected into the live benchmark query. Re-enable behind a config flag
+    if a future evaluation legitimately needs them.
+    """
+    _ = item  # kept for signature stability; type detection no longer alters the query.
+    return query
 
 
 async def run_benchmark(
@@ -268,12 +291,27 @@ async def run_benchmark(
             result_item["benchmark_query"] = query
 
         if is_financebench:
-            answer_text = str(result_item.get("answer", "") or "").lower()
+            answer_text = str(result_item.get("answer", "") or "")
             has_error = bool(result_item.get("error"))
-            answer_attempted = 0.0 if (has_error or "insufficient evidence" in answer_text) else 1.0
+            # Detect abstain on the EXTRACTED final answer (\\boxed{} or
+            # 'Final Answer:' marker), NOT on the full reasoning body. Step-by-
+            # step CoT often uses 'insufficient evidence' as a logical token
+            # while still arriving at a substantive answer; substring matching
+            # the full text mis-classifies those as abstains.
+            final_answer = _extract_final_answer(answer_text).lower()
+            is_abstain = "insufficient evidence" in final_answer
+            judge_score = _safe_float(result_item.get("llm_judge_score", 0.0), 0.0)
+            # Judge override: if the LLM judge already scored this as correct,
+            # the model clearly produced a usable answer regardless of phrasing.
+            if has_error:
+                answer_attempted = 0.0
+            elif judge_score >= 0.5:
+                answer_attempted = 1.0
+            else:
+                answer_attempted = 0.0 if is_abstain else 1.0
             result_item["answer_attempted"] = answer_attempted
+            result_item["final_answer_extracted"] = final_answer[:300]
             if not isinstance(result_item.get("hallucination"), (int, float)):
-                judge_score = _safe_float(result_item.get("llm_judge_score", 0.0), 0.0)
                 result_item["hallucination"] = 1.0 if (answer_attempted > 0.0 and judge_score < 1.0) else 0.0
 
         results.append(result_item)

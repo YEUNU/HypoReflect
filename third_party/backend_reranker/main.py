@@ -32,6 +32,7 @@ model = None
 tokenizer = None
 true_token = None
 false_token = None
+prefix_tokens = None
 suffix_tokens = None
 sampling_params = None
 
@@ -68,8 +69,22 @@ async def load_model():
     
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
-    
+
+    # Use the exact prefix/suffix pattern from the Qwen3-Reranker model card
+    # (raw string concatenation, NOT apply_chat_template). Going through
+    # apply_chat_template + manual suffix produced a near-constant ~0.0001
+    # 'no' verdict regardless of relevance — the model collapses because the
+    # template inserts unexpected control tokens.
+    global prefix_tokens
+    prefix = (
+        "<|im_start|>system\n"
+        "Judge whether the Document meets the requirements based on the Query "
+        "and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+    )
     suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
     suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
     
     true_token = tokenizer("yes", add_special_tokens=False).input_ids[0]
@@ -84,10 +99,8 @@ async def load_model():
     logger.info(f"Reranker Model Loaded. True token: {true_token}, False token: {false_token}")
 
 def format_instruction(instruction, query, doc):
-    return [
-        {"role": "system", "content": "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."},
-        {"role": "user", "content": f"<Instruct>: {instruction}\n\n<Query>: {query}\n\n<Document>: {doc}"}
-    ]
+    """Build the user-content string used between the fixed prefix/suffix."""
+    return f"<Instruct>: {instruction}\n\n<Query>: {query}\n\n<Document>: {doc}"
 
 @app.post("/v1/rerank")
 async def rerank(request: RerankRequest):
@@ -98,27 +111,30 @@ async def rerank(request: RerankRequest):
         return {"scores": []}
 
     # 1. Process Inputs (1 Query vs N Documents)
-    messages = [format_instruction(request.instruction, request.query, doc) for doc in request.documents]
-    tokenized_messages = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False, enable_thinking=False
-    )
-    
+    contents = [format_instruction(request.instruction, request.query, doc) for doc in request.documents]
+    content_token_lists = [tokenizer.encode(text, add_special_tokens=False) for text in contents]
+
     # Max length management (Safety): reserve generation tokens and a small margin.
     reserve_tokens = max(1, int(getattr(sampling_params, "max_tokens", 1)))
     safety_margin = 8
-    max_len = max(1, MAX_MODEL_LEN - len(suffix_tokens) - reserve_tokens - safety_margin)
+    max_content_len = max(
+        1,
+        MAX_MODEL_LEN - len(prefix_tokens) - len(suffix_tokens) - reserve_tokens - safety_margin,
+    )
     truncated_count = 0
     final_inputs = []
-    for ele in tokenized_messages:
-        if len(ele) > max_len:
+    for ele in content_token_lists:
+        if len(ele) > max_content_len:
             truncated_count += 1
-        final_inputs.append(TokensPrompt(prompt_token_ids=ele[:max_len] + suffix_tokens))
+            ele = ele[:max_content_len]
+        full = list(prefix_tokens) + list(ele) + list(suffix_tokens)
+        final_inputs.append(TokensPrompt(prompt_token_ids=full))
     if truncated_count:
         logger.warning(
-            "Truncated %d/%d rerank prompts to max_len=%d (model_max=%d).",
+            "Truncated %d/%d rerank prompts to content_max_len=%d (model_max=%d).",
             truncated_count,
-            len(tokenized_messages),
-            max_len,
+            len(contents),
+            max_content_len,
             MAX_MODEL_LEN,
         )
     
@@ -130,14 +146,14 @@ async def rerank(request: RerankRequest):
         if "maximum model length" not in error_text.lower():
             raise HTTPException(status_code=500, detail=f"Reranker ValueError: {error_text}") from e
 
-        fallback_max_len = max(1, max_len - 128)
+        fallback_max_len = max(1, max_content_len - 128)
         logger.warning(
-            "Rerank overflow detected; retrying with stricter truncation (fallback_max_len=%d).",
+            "Rerank overflow detected; retrying with stricter truncation (fallback_max_content_len=%d).",
             fallback_max_len,
         )
         fallback_inputs = [
-            TokensPrompt(prompt_token_ids=ele[:fallback_max_len] + suffix_tokens)
-            for ele in tokenized_messages
+            TokensPrompt(prompt_token_ids=list(prefix_tokens) + list(ele[:fallback_max_len]) + list(suffix_tokens))
+            for ele in content_token_lists
         ]
         outputs = model.generate(fallback_inputs, sampling_params, use_tqdm=False)
     except Exception as e:

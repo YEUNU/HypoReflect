@@ -1,9 +1,14 @@
+"""Text normalization and query metadata helpers.
+
+Used by retrieval to derive entity/period/doc-type signals from a query and
+calibrate ranking with meta boosts and boilerplate penalties.
+"""
 import re
 import unicodedata
 from typing import Any
 
 
-class TextProcessingSupport:
+class TextUtilsMixin:
     @staticmethod
     def _normalize_entity_term(value: str) -> str:
         """Normalize entity/query tokens for robust graph matching."""
@@ -20,7 +25,6 @@ class TextProcessingSupport:
         if not value:
             return ""
         normalized = unicodedata.normalize("NFKC", str(value))
-        # Remove Lucene query syntax operators/special symbols to avoid parse errors.
         normalized = re.sub(r"[+\-!(){}\[\]^\"~*?:\\/|&]", " ", normalized)
         normalized = re.sub(r"[`]", " ", normalized)
         normalized = re.sub(r"\s+", " ", normalized).strip()
@@ -98,7 +102,7 @@ class TextProcessingSupport:
 
     @staticmethod
     def _entity_term_tokens(value: str) -> set[str]:
-        normalized = TextProcessingSupport._normalize_entity_term(value)
+        normalized = TextUtilsMixin._normalize_entity_term(value)
         return {
             tok for tok in re.findall(r"[a-z0-9]+", normalized)
             if tok not in {"the", "of", "and", "for", "in", "on", "to", "a", "an"}
@@ -124,11 +128,9 @@ class TextProcessingSupport:
         q_lower = q.lower()
         company_candidates: list[str] = []
 
-        # Possessive form (e.g., "AMCOR's", "Coca Cola's").
         for match in re.finditer(r"\b([a-z0-9&.,()\-]{2,40}(?:\s+[a-z0-9&.,()\-]{1,40}){0,3})'s\b", q_lower):
             company_candidates.append(match.group(1).strip())
 
-        # Common finance query patterns.
         for pattern in [
             r"\bfor\s+([a-z0-9&.,'()\- ]{2,80})",
             r"\bof\s+([a-z0-9&.,'()\- ]{2,80})",
@@ -137,7 +139,6 @@ class TextProcessingSupport:
             if match:
                 company_candidates.append(match.group(1).strip())
 
-        # Keep short uppercase tickers/hints from original query casing.
         ticker_stopwords = {
             "FY", "USD", "GAAP", "NON", "Q1", "Q2", "Q3", "Q4",
             "COGS", "ROA", "DPO", "PPNE", "PPE", "AR", "YOY",
@@ -157,7 +158,6 @@ class TextProcessingSupport:
             if normalized:
                 company_keys.add(normalized)
 
-            # Add first token key fallback (e.g., "american express" -> "american").
             first_token = cleaned.split()[0] if cleaned.split() else ""
             first_key = self._normalize_doc_key(first_token)
             if first_key and len(first_key) >= 2:
@@ -216,7 +216,7 @@ class TextProcessingSupport:
 
         for dtype in query_meta.get("doc_types", set()):
             dtype_key = dtype.replace("-", "")
-            if dtype_key in title_key:
+            if dtype_key in title_lower.replace("-", "").replace("_", ""):
                 boost += 0.15
                 break
 
@@ -280,7 +280,6 @@ class TextProcessingSupport:
             if pattern in text_lower:
                 penalty += 0.18
 
-        # Reduce penalty for financial statement/table-like evidence sections.
         if any(marker in text_lower for marker in [
             "consolidated balance sheets",
             "consolidated statements of operations",
@@ -291,3 +290,37 @@ class TextProcessingSupport:
             penalty -= 0.2
 
         return max(0.0, min(0.8, penalty))
+
+    @staticmethod
+    def _build_context_from_nodes(nodes: list[dict[str, Any]]) -> str:
+        return "\n\n".join([
+            f"[[{node['title']}, Page {node.get('page', 0)}, Chunk {node['sent_id']}]]\n{node['text']}"
+            for node in nodes
+        ])
+
+    @staticmethod
+    def _node_identity(node: dict[str, Any]) -> str:
+        node_id = str(node.get("id", "") or "").strip()
+        if node_id:
+            return node_id
+        return (
+            f"{node.get('title', '')}:"
+            f"{node.get('source', '')}:"
+            f"{node.get('page', 0)}:"
+            f"{node.get('sent_id', -1)}"
+        )
+
+    @staticmethod
+    def _dedupe_preserve_order(values: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            normalized = re.sub(r"\s+", " ", text.lower()).strip()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(text)
+        return unique
