@@ -1,14 +1,24 @@
 import asyncio
 import json
 import logging
+import multiprocessing as _mp
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
 from core.config import RAGConfig
 from models.hyporeflect.graphrag import GraphRAG
+from models.hyporeflect.indexing.chunking import parse_pages_offline
 from models.naive.naive_rag import NaiveRAG
+
+
+# Spawn-based context for the parsing worker pool. Using the default `fork`
+# context corrupts the parent process's httpx/openai async clients (vLLM
+# requests stop being dispatched after the pool shuts down), which manifests
+# as 100% CPU on the main thread but 0 reqs at the vLLM serve endpoint.
+_PARSE_MP_CTX = _mp.get_context("spawn")
 
 
 logger = logging.getLogger("HypoReflect")
@@ -97,33 +107,46 @@ async def run_indexing(
             )
 
     semaphore = asyncio.Semaphore(RAGConfig.MAX_CONCURRENT_LLM_CALLS)
+    # Cap how many files can sit in the post-parse chunking+LLM pipeline
+    # simultaneously. Each file's chunker fans out one LLM task per page
+    # (page-summary stage is `gather([get_page_summary(p) for p in pages])`),
+    # bypassing the per-call semaphore. With 16 files × ~200 pages we'd
+    # schedule ~3,200 concurrent coroutines — GIL contention on the asyncio
+    # loop burned CPU at 100% while never actually hitting vLLM. 4 keeps
+    # the page-summary fan-out around ~800 tasks, which empirically lets the
+    # gen server stay saturated without starving on scheduling overhead.
+    file_concurrency = max(1, int(os.environ.get("RAG_MAX_PARALLEL_FILES", "4")))
+    file_semaphore = asyncio.Semaphore(file_concurrency)
     progress = {"count": 0, "lock": asyncio.Lock()}
     processed_docs = []
     failed_files = []
     stats = {"succeeded": 0}
 
-    async def process_file(filename: str, content: str):
-        async with semaphore:
-            async with progress["lock"]:
-                progress["count"] += 1
-                if progress["count"] % 10 == 0:
-                    logger.info("Indexing progress: %d/%d", progress["count"], len(files))
+    async def process_file(filename: str, content: str, prepared_pages: Optional[dict] = None):
+        async with file_semaphore:
+            async with semaphore:
+                async with progress["lock"]:
+                    progress["count"] += 1
+                    if progress["count"] % 10 == 0:
+                        logger.info("Indexing progress: %d/%d", progress["count"], len(files))
 
-            try:
-                if is_graph:
-                    knowledge = await engine.extract_knowledge(content)
-                    doc_id = await engine.create_document_node(filename, {"title": knowledge["title"]})
-                    await engine.build_graph(knowledge, source=filename, document_filename=doc_id)
+                try:
+                    if is_graph:
+                        knowledge = await engine.extract_knowledge(
+                            content, prepared_pages=prepared_pages
+                        )
+                        doc_id = await engine.create_document_node(filename, {"title": knowledge["title"]})
+                        await engine.build_graph(knowledge, source=filename, document_filename=doc_id)
+                        async with progress["lock"]:
+                            processed_docs.append(doc_id)
+                    else:
+                        await engine.index_document(filename, content)
                     async with progress["lock"]:
-                        processed_docs.append(doc_id)
-                else:
-                    await engine.index_document(filename, content)
-                async with progress["lock"]:
-                    stats["succeeded"] += 1
-            except Exception as exc:
-                logger.error("Failed to index file %s: %s", filename, exc)
-                async with progress["lock"]:
-                    failed_files.append((filename, str(exc)))
+                        stats["succeeded"] += 1
+                except Exception as exc:
+                    logger.error("Failed to index file %s: %s", filename, exc)
+                    async with progress["lock"]:
+                        failed_files.append((filename, str(exc)))
 
     file_contents = []
     for filename in files:
@@ -134,8 +157,31 @@ async def run_indexing(
             logger.error("Failed to read file %s: %s", filename, exc)
             failed_files.append((filename, f"read_error: {exc}"))
 
+    # Page parsing is pure-CPU regex/string work — offload to a process pool
+    # so it runs in parallel with the GPU pipeline rather than serializing on
+    # the GIL. Only used for graph strategies (naive doesn't need pages).
+    prepared_lookup: dict[str, dict] = {}
+    if is_graph and file_contents:
+        worker_count = max(1, min(len(file_contents), os.cpu_count() or 4))
+        loop = asyncio.get_event_loop()
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=_PARSE_MP_CTX) as parse_pool:
+            parse_tasks = [
+                loop.run_in_executor(parse_pool, parse_pages_offline, fn, ct)
+                for fn, ct in file_contents
+            ]
+            parsed_results = await asyncio.gather(*parse_tasks, return_exceptions=True)
+        for (fn, _ct), result in zip(file_contents, parsed_results):
+            if isinstance(result, Exception):
+                logger.warning("Page parsing failed for %s; will re-parse in main process: %s", fn, result)
+                continue
+            prepared_lookup[fn] = result
+        logger.info(
+            "Parallel page parsing complete: %d/%d files prepared (workers=%d).",
+            len(prepared_lookup), len(file_contents), worker_count,
+        )
+
     gather_results = await asyncio.gather(
-        *[process_file(filename, content) for filename, content in file_contents],
+        *[process_file(fn, ct, prepared_lookup.get(fn)) for fn, ct in file_contents],
         return_exceptions=True,
     )
     for idx, result in enumerate(gather_results):

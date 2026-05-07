@@ -45,6 +45,127 @@ def _make_semantic_chunk_id(source, title, sent_id):
     return hashlib.md5(content_sig.encode()).hexdigest()
 
 
+# --- chunk cache (skip LLM regeneration on rerun) -----------------------------
+#
+# After a successful `extract_knowledge` we persist the resulting chunks
+# (page summaries, Q-/Q+, chunk_summary, text/page/sent_id metadata) to
+# `data/index_cache/<corpus_tag>/<source>__<sha8>.json`. Rerunning indexing
+# on the same file under the same paper-relevant ablation flags loads the
+# cache and returns the prior knowledge dict — embeddings are still
+# regenerated downstream, since they're cheap (vLLM batch) and the embedding
+# model can change independently of LLM-generated text.
+
+_CHUNK_CACHE_VERSION = "v1"
+
+
+def _chunk_cache_root() -> str:
+    return os.environ.get("RAG_CHUNK_CACHE_DIR", os.path.join("data", "index_cache"))
+
+
+def _chunk_cache_enabled() -> bool:
+    return os.environ.get("RAG_CHUNK_CACHE", "on").strip().lower() not in {"off", "false", "0", "no"}
+
+
+def _ablation_signature() -> str:
+    """Cache key fragment that invalidates when the chunking-relevant
+    ablation flags change (different ablation = different chunk shape)."""
+    return (
+        f"adapt={int(RAGConfig.ABLATION_ADAPTIVE_CHUNKING)}"
+        f"-summary={int(RAGConfig.ABLATION_ROLLING_SUMMARY)}"
+        f"-table={int(RAGConfig.ABLATION_TABLE_TO_TEXT)}"
+        f"-qm={int(RAGConfig.ABLATION_Q_MINUS)}"
+        f"-qp={int(RAGConfig.ABLATION_Q_PLUS)}"
+    )
+
+
+def _content_sha8(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _chunk_cache_path(corpus_tag: str, source: str, content_sha: str) -> str:
+    safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", corpus_tag or "default")
+    safe_src = re.sub(r"[^A-Za-z0-9_.-]+", "_", source or "doc")
+    abl = re.sub(r"[^A-Za-z0-9=_-]+", "_", _ablation_signature())
+    fname = f"{safe_src}__{content_sha}__{abl}.json"
+    return os.path.join(_chunk_cache_root(), _CHUNK_CACHE_VERSION, safe_tag, fname)
+
+
+def _chunk_cache_load(corpus_tag: str, source: str, content: str) -> "dict[str, Any] | None":
+    if not _chunk_cache_enabled():
+        return None
+    path = _chunk_cache_path(corpus_tag, source, _content_sha8(content))
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict) or "chunks" not in data:
+            return None
+        return data
+    except Exception as exc:
+        logger.warning("chunk cache read failed for %s: %s", path, exc)
+        return None
+
+
+def _chunk_cache_save(corpus_tag: str, source: str, content: str, knowledge: dict) -> None:
+    if not _chunk_cache_enabled():
+        return
+    path = _chunk_cache_path(corpus_tag, source, _content_sha8(content))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(knowledge, fh, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        logger.warning("chunk cache write failed for %s: %s", path, exc)
+
+
+# Top-level (picklable) page-parsing helper for ProcessPoolExecutor offload.
+# All page split / regex work runs on a worker process so the main asyncio
+# loop can keep dispatching LLM/embedding calls concurrently. Output is a
+# plain dict — no graph-rag state, no tokenizer / numpy dependencies.
+_PAGE_RE = re.compile(r"-+\s*Page\s*(\d+)\s*-+", re.IGNORECASE)
+
+
+def parse_pages_offline(filename: str, content: str) -> dict[str, Any]:
+    """Pure-CPU page parsing extracted from `extract_knowledge`.
+
+    Splits the document text on `--- Page N ---` markers (paper §3.1.1
+    topology-preserving OCR output) and returns title + ordered page list.
+    Designed to be safely run inside `concurrent.futures.ProcessPoolExecutor`.
+    """
+    lines = content.split("\n")
+    title = "Unknown"
+    if lines and lines[0].startswith("Document: "):
+        title = lines[0].replace("Document: ", "").strip()
+    elif lines and lines[0].startswith("Title: "):
+        title = lines[0].replace("Title: ", "").strip()
+
+    matches = list(_PAGE_RE.finditer(content))
+    pages: list[dict[str, Any]] = []
+    if matches:
+        for index, start_match in enumerate(matches):
+            page_num = int(start_match.group(1))
+            content_start = start_match.end()
+            content_end = matches[index + 1].start() if index < len(matches) - 1 else len(content)
+            page_text = content[content_start:content_end].strip()
+            if page_text:
+                pages.append({"num": page_num, "content": page_text})
+
+    if not pages:
+        # Fallback: no `--- Page N ---` markers → emit whole document body
+        # under page 1 (chunking layer applies its own sentence split later).
+        start_idx = 0
+        if lines and (lines[0].startswith("Title: ") or lines[0].startswith("Document: ")):
+            start_idx = 1
+        body = "\n".join(lines[start_idx:]).strip()
+        if body:
+            pages = [{"num": 1, "content": body}]
+
+    return {"filename": filename, "title": title, "pages": pages}
+
+
 class ChunkingMixin:
     def _save_debug(self, doc_name: str, step: str, data: Any):
         doc_dir = os.path.join(self.debug_output_dir, doc_name.replace(" ", "_").replace("/", "_"))
@@ -91,34 +212,64 @@ class ChunkingMixin:
                         fallback.append(", ".join(pairs) + ".")
             return fallback if fallback else table_lines
 
-    async def extract_knowledge(self, content: str, source: str = "") -> dict[str, Any]:
-        lines = content.split("\n")
-        title = "Unknown"
-        if lines and lines[0].startswith("Document: "):
-            title = lines[0].replace("Document: ", "").strip()
-        elif lines and lines[0].startswith("Title: "):
-            title = lines[0].replace("Title: ", "").strip()
+    async def extract_knowledge(
+        self,
+        content: str,
+        source: str = "",
+        prepared_pages: "dict[str, Any] | None" = None,
+    ) -> dict[str, Any]:
+        # On-disk chunk cache: skips every LLM call (page summary + Q-/Q+ +
+        # chunk_summary) when the same source content was already chunked
+        # under the same ablation flags. Cache key = sha256(content) +
+        # ablation signature. Embeddings are *not* cached — they're cheap
+        # via vLLM batching and the embed model can change independently.
+        cached = _chunk_cache_load(self.corpus_tag, source, content)
+        if cached is not None:
+            cached_title = cached.get("title", "Unknown")
+            chunk_count = len(cached.get("chunks") or [])
+            logger.info(
+                "[%s] chunk cache HIT (corpus=%s, chunks=%d) — skipping LLM regen",
+                cached_title, self.corpus_tag, chunk_count,
+            )
+            return cached
 
-        logger.info("[%s] Content head (500 chars): %r", title, content[:500])
+        # Optional fast-path: caller already ran `parse_pages_offline` in a
+        # ProcessPoolExecutor worker. Skip the regex/string splits here and
+        # reuse the precomputed (title, pages) tuple. Falls back to in-process
+        # parsing when no prepared payload is provided (preserves prior API).
+        if prepared_pages is not None:
+            title = prepared_pages.get("title", "Unknown")
+            pages = list(prepared_pages.get("pages") or [])
+            logger.info("[%s] Content head (500 chars): %r", title, content[:500])
+            logger.info("[%s] Parsed %d pages (offloaded)", title, len(pages))
+        else:
+            lines = content.split("\n")
+            title = "Unknown"
+            if lines and lines[0].startswith("Document: "):
+                title = lines[0].replace("Document: ", "").strip()
+            elif lines and lines[0].startswith("Title: "):
+                title = lines[0].replace("Title: ", "").strip()
 
-        page_pattern = re.compile(r"-+\s*Page\s*(\d+)\s*-+", re.IGNORECASE)
-        matches = list(page_pattern.finditer(content))
+            logger.info("[%s] Content head (500 chars): %r", title, content[:500])
 
-        pages = []
-        if matches:
-            for index, start_match in enumerate(matches):
-                page_num = int(start_match.group(1))
-                content_start = start_match.end()
-                if index < len(matches) - 1:
-                    content_end = matches[index + 1].start()
-                else:
-                    content_end = len(content)
+            page_pattern = re.compile(r"-+\s*Page\s*(\d+)\s*-+", re.IGNORECASE)
+            matches = list(page_pattern.finditer(content))
 
-                page_text = content[content_start:content_end].strip()
-                if page_text:
-                    pages.append({"num": page_num, "content": page_text})
+            pages = []
+            if matches:
+                for index, start_match in enumerate(matches):
+                    page_num = int(start_match.group(1))
+                    content_start = start_match.end()
+                    if index < len(matches) - 1:
+                        content_end = matches[index + 1].start()
+                    else:
+                        content_end = len(content)
 
-        logger.info("[%s] Parsed %d pages from content.", title, len(pages))
+                    page_text = content[content_start:content_end].strip()
+                    if page_text:
+                        pages.append({"num": page_num, "content": page_text})
+
+            logger.info("[%s] Parsed %d pages from content.", title, len(pages))
 
         if not pages:
             logger.info("[%s] No page markers found, using standard chunking fallback", title)
@@ -340,4 +491,6 @@ class ChunkingMixin:
             for chunk in final_chunks
         ])
 
-        return {"title": title, "chunks": final_chunks}
+        knowledge = {"title": title, "chunks": final_chunks}
+        _chunk_cache_save(self.corpus_tag, source, content, knowledge)
+        return knowledge
