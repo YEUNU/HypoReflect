@@ -67,8 +67,8 @@ Service orchestration (Neo4j + vLLM gen/ocr/embed/rerank on ports 7474/7687, 280
 ./run_servers.sh all          # start all
 ./run_servers.sh {neo4j|gen|ocr|embed|rerank}
 ./stop_servers.sh all
-python3 probe_ports.py        # quick port check
-python3 check_env.py          # env sanity check
+python3 scripts/probe_ports.py        # quick port check
+python3 scripts/check_env.py          # env sanity check
 ```
 
 Indexing / benchmarking (wrappers around `main.py`; auto-start required services unless `--skip-server`):
@@ -130,6 +130,6 @@ Each result JSON contains averaged metrics, per-query `details`, category breakd
 - The `GraphRAG` instance attribute is **`self.llm`** (not `self.vllm`). When patching in tests, mock `rag.llm.rerank` / `rag.llm.get_embeddings`.
 - The full pipeline is reachable via `AgentService.run_workflow` (`models/hyporeflect/service.py`), which delegates to `Orchestrator` (`models/hyporeflect/orchestrator.py`). The R_max=2 refinement loop and lexicographic non-regression guard live in `RefinementOrchestrator` inside `stages/refinement.py` — that's the test patch point (`service._orchestrator.refinement_loop.run_loop`), not `service._run_refinement_loop` (which no longer exists).
 - Always close drivers cleanly: `main.py` calls `Neo4jService.global_close()` and `VLLMClient.global_close()` in a `finally` block. New entry points should do the same.
-- Ports are fixed (see Services section); changing them requires updating `run_servers.sh`, `probe_ports.py`, and any client URLs.
+- Ports are fixed (see Services section); changing them requires updating `run_servers.sh`, `scripts/probe_ports.py`, and any client URLs.
 - Do not introduce new benchmarks; FinanceBench is the only target.
 - Domain-specific post-refinement override builders (operating-margin/segment-drag/quick-ratio/debt-securities/capital-intensity/dividend-stability) were removed during the paper-aligned refactor. Don't reintroduce them — they were FinanceBench-specific patches not in the paper.

@@ -83,8 +83,8 @@ Default ports:
 Quick checks:
 
 ```bash
-python3 probe_ports.py
-python3 check_env.py
+python3 scripts/probe_ports.py
+python3 scripts/check_env.py
 ```
 
 ## Data Preparation
@@ -342,8 +342,8 @@ pytest -q -m integration
 Useful targeted checks:
 
 ```bash
-python check_indexes.py
-python test_neo4j_conn.py
+python scripts/check_indexes.py
+python scripts/test_neo4j_conn.py
 ```
 
 ## Main Entry Points

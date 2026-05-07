@@ -235,3 +235,4 @@ data/hotpotqa_queries.json
 
 # Local-only paper draft
 hyporeflect.pdf
+.claude/

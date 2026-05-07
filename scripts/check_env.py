@@ -4,8 +4,9 @@ import httpx
 from neo4j import AsyncGraphDatabase
 import sys
 
-# Add current directory to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Ensure project root is on sys.path so `from core.* import` works regardless
+# of the cwd this script is invoked from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.vllm_client import VLLMClient
 from core.neo4j_service import Neo4jService

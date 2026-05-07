@@ -16,6 +16,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Centralize all server stdout/stderr under logs/ instead of dropping files at
+# the repo root. The directory is gitignored; ensure it exists at runtime so
+# fresh clones don't fail the redirects below.
+mkdir -p logs
+
 SERVICE=$1
 
 # Optional Java setup (for local/custom Neo4j distributions)
@@ -155,7 +160,7 @@ start_neo4j() {
             return 1
         fi
         echo "Starting Neo4j..."
-        nohup "${neo4j_cmd}" start > neo4j.log 2>&1 &
+        nohup "${neo4j_cmd}" start > logs/neo4j.log 2>&1 &
     else
         echo "✅ Neo4j is already UP"
     fi
@@ -182,7 +187,7 @@ start_gen() {
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_xml \
         --attention-backend FLASHINFER \
-        --trust-remote-code > vllm_gen.log 2>&1 &
+        --trust-remote-code > logs/vllm_gen.log 2>&1 &
 }
 
 start_ocr() {
@@ -207,7 +212,7 @@ start_ocr() {
         --attention-backend FLASHINFER \
         --trust-remote-code \
         --limit-mm-per-prompt '{"image":1}' \
-        --mm-processor-cache-gb 0.5 > vllm_ocr.log 2>&1 &
+        --mm-processor-cache-gb 0.5 > logs/vllm_ocr.log 2>&1 &
 }
 
 start_embed() {
@@ -229,7 +234,7 @@ start_embed() {
         --gpu-memory-utilization 0.40 \
         --max-model-len 16384 \
         --attention-backend FLASHINFER \
-        --trust-remote-code > embedding.log 2>&1 &
+        --trust-remote-code > logs/embedding.log 2>&1 &
 }
 
 start_rerank() {
@@ -249,7 +254,7 @@ start_rerank() {
     export RERANKER_GPU_UTIL=0.25
     export RERANKER_MAX_MODEL_LEN=4096
     export RERANKER_ATTENTION_BACKEND="FLASHINFER"
-    nohup .venv/bin/uvicorn third_party.backend_reranker.main:app --host 0.0.0.0 --port 18083 > reranker.log 2>&1 &
+    nohup .venv/bin/uvicorn third_party.backend_reranker.main:app --host 0.0.0.0 --port 18083 > logs/reranker.log 2>&1 &
 }
 
 case $SERVICE in

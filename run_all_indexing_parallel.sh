@@ -122,4 +122,4 @@ run_task "ms_graphrag_no_summary" "RAG_ABLATION_SUMMARY=False ./run_index.sh --m
 
 echo -e "\nWaiting for all indexing tasks to finish..."
 wait
-echo -e "\nAll indexing tasks completed! Check results with 'python check_indexes.py'"
+echo -e "\nAll indexing tasks completed! Check results with 'python scripts/check_indexes.py'"
