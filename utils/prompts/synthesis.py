@@ -66,6 +66,8 @@ Rules:
 2. Treat EVIDENCE_LEDGER as the primary accepted operand set for compute checks.
 3. For compute, verify arithmetic directly from values used in answer; if arithmetic is wrong, FAIL.
 4. For compute, if answer uses values outside EVIDENCE_LEDGER, FAIL.
+4a. Operand-slot provenance: for compute, each numeric operand in the answer must come from the EVIDENCE_LEDGER entry whose `slot` tag matches both the operand's claimed metric and period. If the answer used an entry tagged with a different metric or a different period than the slot it is filling, FAIL with `operand_slot_mismatch` and identify which ledger entry should have been used instead. When multiple ledger entries report values for the same metric across different periods, never use one period's value to fill another period's slot.
+4b. Operand-magnitude sanity: if QUERY_STATE.metric is a totals/aggregate concept (e.g., total revenue, total assets) and the chosen operand value is conspicuously smaller (≤25%) than another same-metric same-period candidate present in EVIDENCE_LEDGER or CONTEXT primary statement, FAIL with `operand_magnitude_anomaly`. Prefer the larger primary-statement total over a sub-line-item value.
 5. Fail on wrong/unsupported claims, invalid/missing citations, hallucinations, or query-constraint mismatch.
 6. Hard FAIL if any cited evidence conflicts with QUERY_STATE entity/period.
 7. Hard FAIL if answer says insufficient evidence while required slot coverage is complete in EVIDENCE_LEDGER.

@@ -128,8 +128,21 @@ class TextUtilsMixin:
         q_lower = q.lower()
         company_candidates: list[str] = []
 
-        for match in re.finditer(r"\b([a-z0-9&.,()\-]{2,40}(?:\s+[a-z0-9&.,()\-]{1,40}){0,3})'s\b", q_lower):
-            company_candidates.append(match.group(1).strip())
+        # Capture the 1-3 words immediately preceding the possessive 's.
+        # The previous regex `(...){2,40}(?:\s+...){0,3}` was greedy and
+        # extended the leading context far past the actual entity (e.g., for
+        # "What is Amazon's revenue" it captured "what is amazon" → noise key
+        # "whatisamazon" instead of "amazon"). The simpler form below picks up
+        # just the noun phrase right before 's.
+        for match in re.finditer(r"((?:[a-z0-9&.()\-]+\s+){0,2}[a-z0-9&.()\-]{2,40})'s\b", q_lower):
+            phrase = match.group(1).strip()
+            company_candidates.append(phrase)
+            tokens = phrase.split()
+            if tokens:
+                # Also append just the last token — handles "Amazon's"
+                # captured as "amazon" even when the {0,2} prefix matches
+                # extra words.
+                company_candidates.append(tokens[-1])
 
         for pattern in [
             r"\bfor\s+([a-z0-9&.,'()\- ]{2,80})",

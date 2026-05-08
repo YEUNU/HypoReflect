@@ -55,7 +55,7 @@ def _make_semantic_chunk_id(source, title, sent_id):
 # regenerated downstream, since they're cheap (vLLM batch) and the embedding
 # model can change independently of LLM-generated text.
 
-_CHUNK_CACHE_VERSION = "v1"
+_CHUNK_CACHE_VERSION = "v3"  # v3: table-to-text structural check now splits multi-line blobs on \n before column-count heuristic (fixes false bypass on well-formed tables embedded in raw_sentences)
 
 
 def _chunk_cache_root() -> str:
@@ -175,12 +175,25 @@ class ChunkingMixin:
             json.dump(data, handle, ensure_ascii=False, indent=2, default=str)
         logger.info("[DEBUG] Saved %s to %s", step, filepath)
 
-    async def _table_to_text(self, table_lines: list[str]) -> list[str]:
+    async def _table_to_text(
+        self,
+        table_lines: list[str],
+        title: str = "",
+        page: int = 0,
+    ) -> list[str]:
         """Sentence-by-sentence rendering of a markdown-pipe table.
 
         Used inside Level-2 sentence iteration when OCR'd input still contains
         raw `|`-delimited table fragments. The OCR pipeline (§3.1.1) is the
         primary table-to-text path; this is a fallback.
+
+        Year/period environment is sourced ONLY from the table's own column
+        headers. Earlier runs leaked a "2024" hallucination into chunks of
+        2023 filings whenever OCR dropped the year sub-header — the LLM had
+        no anchor and defaulted to its training-time current year. Two new
+        guards: (a) detect header/data column-count mismatch up-front and
+        bypass the LLM entirely; (b) prompt rule 7/8 forbid inferring a
+        period from the document title.
         """
         if not table_lines:
             return []
@@ -189,14 +202,91 @@ class ChunkingMixin:
             logger.info("Ablation: Skipping table-to-text conversion.")
             return table_lines
 
+        # Pre-flight structural check. Markdown tables emitted by OCR have
+        # the form `| h1 | h2 | h3 |` with `|---|---|---|` separator. We
+        # tolerate the row-label column being implicit (data row may have
+        # one extra column for the row label), but anything beyond that is
+        # a sign that the header was truncated and the columns can no
+        # longer be aligned reliably.
+        #
+        # Inputs may be multi-line blobs (raw_sentences upstream is split on
+        # `.!?\s`, so a single "sentence" can contain a heading + table +
+        # tail prose stitched by `\n`). Expand newlines first so the
+        # column-count heuristic operates on real table rows, not on the
+        # entire blob — otherwise `line.split("|")` collapses dozens of
+        # rows into one fake row of dozens of cells and we falsely flag
+        # well-formed tables as broken.
+        rows: list[list[str]] = []
+        for raw in table_lines:
+            for line in raw.split("\n"):
+                if "|" not in line:
+                    continue
+                cells = [c.strip() for c in line.split("|")]
+                cells = [c for c in cells if c != ""]
+                if not cells:
+                    continue
+                if all(set(c) <= {"-", ":"} for c in cells):
+                    continue  # markdown separator row
+                rows.append(cells)
+
+        if len(rows) >= 2:
+            header_cols = len(rows[0])
+            data_cols_max = max(len(r) for r in rows[1:])
+            if header_cols + 1 < data_cols_max:
+                # Two-level header tables (Case B in tests) place a year/quarter
+                # sub-header in row 1, which our flat parser counts as a data
+                # row and falsely flags as a mismatch. Only treat it as broken
+                # when row 1 does NOT carry period tokens.
+                #
+                # Detection is lenient: cells may be wrapped in markdown
+                # emphasis (``**Q1 2023**``), may include comparison
+                # markers ("vs. Q1 2022"), or may be dates ("December 31,
+                # 2022"). Anything that contains a recognizable year/quarter
+                # token in <=30 chars counts as a period anchor.
+                period_token_re = re.compile(
+                    r"(?:19|20)\d{2}|[Qq][1-4]\b|\b[1-4][Qq]\b|FY\s?\d{2,4}|H[12]\b",
+                    re.IGNORECASE,
+                )
+
+                def _looks_like_period(cell: str) -> bool:
+                    stripped = cell.strip().strip("*_ ").strip()
+                    if not stripped or len(stripped) > 30:
+                        return False
+                    return bool(period_token_re.search(stripped))
+
+                second_row = rows[1]
+                tail = second_row[1:] if len(second_row) > 1 else []
+                period_hits = sum(1 for c in tail if _looks_like_period(c))
+                # Require the tail to be majority-period to count as a
+                # sub-header (defends against a data row that just happens to
+                # contain a stray year reference).
+                if not (tail and period_hits * 2 >= len(tail)):
+                    logger.warning(
+                        "[%s p%d] Broken table header: %d header cols vs %d data cols, "
+                        "no period sub-header detected. Skipping LLM conversion to "
+                        "avoid period hallucination; keeping raw markdown lines.",
+                        title or "?", page, header_cols, data_cols_max,
+                    )
+                    return table_lines
+
         table_text = "\n".join(table_lines)
-        prompt = TABLE_TO_TEXT_PROMPT + f"\nTABLE:\n{table_text}"
+        context_block = (
+            f"DOCUMENT: {title} (page {page})\n" if title else ""
+        )
+        prompt = TABLE_TO_TEXT_PROMPT + f"\n{context_block}TABLE:\n{table_text}"
         messages = [{"role": "user", "content": prompt}]
         try:
             response = await self.llm.generate_response(messages, apply_default_sampling=False)
             converted = [sentence.strip() for sentence in response.split("\n") if sentence.strip()]
             if not converted:
                 raise ValueError("Empty conversion result")
+            # Rule 8 escape hatch: LLM signals it can't safely convert.
+            if any("<table-structure-unclear>" in line for line in converted):
+                logger.info(
+                    "[%s p%d] LLM flagged table structure unclear; keeping raw lines.",
+                    title or "?", page,
+                )
+                return table_lines
             return converted
         except Exception as error:
             logger.warning("Table conversion failed (%s), using structured fallback", error)
@@ -297,14 +387,21 @@ class ChunkingMixin:
                     "group_summary": "",
                 })
         else:
+            # Per-file page-summary semaphore caps how many page-summary LLM
+            # calls are in-flight at once. Without this, a 200-page file fires
+            # 200 simultaneous coroutines; with file_concurrency=16 that's 3200
+            # which saturates the asyncio loop (CPU 100%, GPU 0).
+            page_summary_sem = asyncio.Semaphore(RAGConfig.MAX_PARALLEL_PAGES)
+
             async def get_page_summary(page_text: str) -> str:
-                prompt = PAGE_SUMMARY_PROMPT.format(text=page_text[:2000])
-                messages = [{"role": "user", "content": prompt}]
-                try:
-                    return await self.indexing_llm.generate_response(messages, apply_default_sampling=False)
-                except Exception:
-                    sentences = re.split(r"(?<=[.!?])\s+", page_text.strip())
-                    return " ".join(sentences[:2]) if sentences else page_text[:200]
+                async with page_summary_sem:
+                    prompt = PAGE_SUMMARY_PROMPT.format(text=page_text[:2000])
+                    messages = [{"role": "user", "content": prompt}]
+                    try:
+                        return await self.indexing_llm.generate_response(messages, apply_default_sampling=False)
+                    except Exception:
+                        sentences = re.split(r"(?<=[.!?])\s+", page_text.strip())
+                        return " ".join(sentences[:2]) if sentences else page_text[:200]
 
             page_summary_tasks = [get_page_summary(page["content"]) for page in pages]
             page_summaries = await asyncio.gather(*page_summary_tasks)
@@ -369,17 +466,51 @@ class ChunkingMixin:
         ])
 
         # ----- Level 2: sentence-level adaptive splitting + rolling context -----
-        final_chunks = []
-        global_sent_id = 0
+        #
+        # The original implementation chained chunks through a per-chunk
+        # `recent_summary` (chunk_{i-1}.summary fed as Recent: into chunk_i's
+        # HOPRAG prompt). That dependency forced chunk-level LLM calls to run
+        # strictly sequentially within a file — even with file_concurrency=16
+        # the gen server only saw 2-5 in-flight requests because every chunk
+        # in every file was waiting on its predecessor.
+        #
+        # Option C (paper §3.1.2 with grain shift):
+        #   - "prev-summary" now refers to the preceding *page-group's*
+        #     group_summary, not the preceding chunk's chunk_summary. Group
+        #     summaries are pre-computed in parallel above (line ~437) so this
+        #     anchor is free.
+        #   - "milestones" are sampled from the running list of group_summaries
+        #     up to but not including the current group, capped at the most
+        #     recent two (matches the paper's "Key points: A | B" pattern).
+        #   - Within a page-group, all chunk-level HOPRAG calls now fan out
+        #     concurrently via asyncio.gather — they share the same rolling
+        #     context (which depends only on the prior groups, not on each
+        #     other), so the dependency is broken cleanly.
+        #   - Across page-groups, process_group invocations are themselves
+        #     gathered. Determinism preserved by assigning sent_id post-hoc
+        #     in pg_idx order.
         first_group_summary = page_groups[0].get("group_summary", "") if page_groups else ""
         intro_summary = first_group_summary if first_group_summary else f"Document: {title}"
-        milestone_summaries = []
-        recent_summary = ""
-        milestone_interval = RAGConfig.MILESTONE_INTERVAL
+        all_group_summaries: list[str] = [g.get("group_summary", "") for g in page_groups]
         chunk_sem = asyncio.Semaphore(RAGConfig.MAX_CONCURRENT_LLM_CALLS)
 
+        def _build_rolling_context(pg_idx: int) -> str:
+            if not RAGConfig.ABLATION_ROLLING_SUMMARY:
+                return f"Document: {title}"
+            context_parts = [intro_summary]
+            prior_summaries = [s for s in all_group_summaries[:pg_idx] if s]
+            # Milestones: up to the two most recent prior-group summaries
+            # (excluding the immediately preceding one if we'll use it as
+            # `Recent` below, to avoid duplication).
+            if len(prior_summaries) >= 2:
+                milestones = prior_summaries[:-1][-2:]
+                if milestones:
+                    context_parts.append(f"Key points: {' | '.join(milestones)}")
+            if prior_summaries:
+                context_parts.append(f"Recent: {prior_summaries[-1]}")
+            return " || ".join(context_parts)
+
         async def process_group(pg_idx, page_group):
-            nonlocal global_sent_id, recent_summary
             group_content = page_group["content"]
             group_start_page = page_group["start_page"]
             if not group_content:
@@ -389,20 +520,26 @@ class ChunkingMixin:
             if not raw_sentences:
                 return []
 
-            processed_sentences = []
-            table_buffer = []
+            processed_sentences: list[str] = []
+            table_buffer: list[str] = []
             for line in raw_sentences:
                 if "|" in line:
                     table_buffer.append(line)
                 else:
                     if table_buffer:
-                        processed_sentences.extend(await self._table_to_text(table_buffer))
+                        processed_sentences.extend(
+                            await self._table_to_text(table_buffer, title=title, page=group_start_page)
+                        )
                         table_buffer = []
                     processed_sentences.append(line)
             if table_buffer:
-                processed_sentences.extend(await self._table_to_text(table_buffer))
+                processed_sentences.extend(
+                    await self._table_to_text(table_buffer, title=title, page=group_start_page)
+                )
 
-            group_chunks = []
+            if not processed_sentences:
+                return []
+
             sent_embeds = await self.llm.get_embeddings(processed_sentences)
 
             if len(sent_embeds) > 1:
@@ -411,12 +548,24 @@ class ChunkingMixin:
                     for k in range(len(sent_embeds) - 1)
                 ]
                 avg_sim = sum(similarities) / len(similarities)
-                adaptive_threshold = min(RAGConfig.SIMILARITY_THRESHOLD, avg_sim - 0.1)
+                # Two-sided adaptive threshold (paper §3.1.2): pivot around
+                # the empirical mean similarity but clamp around the
+                # configured tau_chunk so high-cohesion regions don't force
+                # over-splitting and low-cohesion regions don't merge across
+                # topic boundaries. Previous one-sided `min(tau, avg-0.1)`
+                # always lowered the threshold, never used the configured
+                # value, and effectively made tau_chunk a no-op for
+                # high-cohesion regions.
+                low_band = RAGConfig.SIMILARITY_THRESHOLD - 0.1
+                high_band = RAGConfig.SIMILARITY_THRESHOLD + 0.1
+                pivot = avg_sim - 0.1
+                adaptive_threshold = max(low_band, min(high_band, pivot))
             else:
                 adaptive_threshold = RAGConfig.SIMILARITY_THRESHOLD
 
             min_chunk_sentences = RAGConfig.MIN_CHUNK_SENTENCES
-            current_group = []
+            current_group: list[str] = []
+            chunk_texts: list[str] = []
 
             for index in range(len(processed_sentences)):
                 current_group.append(processed_sentences[index])
@@ -430,54 +579,52 @@ class ChunkingMixin:
                     should_split = True
 
                 if should_split:
-                    chunk_text = " ".join(current_group)
-
-                    async with chunk_sem:
-                        if not RAGConfig.ABLATION_ROLLING_SUMMARY:
-                            rolling_context = f"Document: {title}"
-                        else:
-                            context_parts = [intro_summary]
-                            if milestone_summaries:
-                                context_parts.append(f"Key points: {' | '.join(milestone_summaries[-2:])}")
-                            if recent_summary:
-                                context_parts.append(f"Recent: {recent_summary}")
-                            rolling_context = " || ".join(context_parts)
-
-                        q_data = await self.extract_hoprag_queries_with_rolling(chunk_text, title, rolling_context)
-
-                    group_chunks.append({
-                        "page": group_start_page,
-                        "text": chunk_text,
-                        "title": title,
-                        "q_minus": q_data.get("q_minus", []),
-                        "q_plus": q_data.get("q_plus", []),
-                        "summary": q_data.get("summary", ""),
-                    })
-
-                    new_summary = q_data.get("summary", "")
-                    if new_summary:
-                        recent_summary = new_summary
-
+                    chunk_texts.append(" ".join(current_group))
                     current_group = []
 
-            return group_chunks
+            if not chunk_texts:
+                return []
 
-        for index, page_group in enumerate(page_groups):
-            logger.info(
-                "[%s] Processing Page Group %d/%d (Pages: %s)",
-                title,
-                index + 1,
-                len(page_groups),
-                page_group["pages"],
-            )
-            group_chunks = await process_group(index, page_group)
+            rolling_context = _build_rolling_context(pg_idx)
+
+            async def hoprag_for_chunk(chunk_text: str):
+                async with chunk_sem:
+                    return await self.extract_hoprag_queries_with_rolling(
+                        chunk_text, title, rolling_context
+                    )
+
+            q_results = await asyncio.gather(*[hoprag_for_chunk(t) for t in chunk_texts])
+
+            return [
+                {
+                    "page": group_start_page,
+                    "text": chunk_text,
+                    "title": title,
+                    "q_minus": q_data.get("q_minus", []),
+                    "q_plus": q_data.get("q_plus", []),
+                    "summary": q_data.get("summary", ""),
+                }
+                for chunk_text, q_data in zip(chunk_texts, q_results)
+            ]
+
+        logger.info("[%s] Fan-out: processing %d page groups in parallel", title, len(page_groups))
+        per_group_results = await asyncio.gather(
+            *[process_group(idx, pg) for idx, pg in enumerate(page_groups)]
+        )
+
+        final_chunks: list[dict] = []
+        global_sent_id = 0
+        for idx, group_chunks in enumerate(per_group_results):
+            if group_chunks:
+                logger.info(
+                    "[%s] Page Group %d/%d done (%d chunks, pages: %s)",
+                    title, idx + 1, len(page_groups), len(group_chunks),
+                    page_groups[idx]["pages"],
+                )
             for group_chunk in group_chunks:
                 group_chunk["sent_id"] = global_sent_id
                 final_chunks.append(group_chunk)
                 global_sent_id += 1
-
-                if global_sent_id % milestone_interval == 0 and group_chunk["summary"]:
-                    milestone_summaries.append(group_chunk["summary"])
 
         self._save_debug(title, "step3_final_chunks", [
             {

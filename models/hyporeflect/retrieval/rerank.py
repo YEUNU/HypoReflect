@@ -49,9 +49,21 @@ class RerankMixin:
         reranked_nodes = sorted(candidates, key=lambda item: item.get("final_score", 0.0), reverse=True)
         company_keys = set(query_meta.get("company_keys") or [])
         if company_keys:
-            matched_first = [node for node in reranked_nodes if self._node_matches_company(node, query_meta)]
-            if matched_first:
-                reranked_nodes = matched_first + [node for node in reranked_nodes if not self._node_matches_company(node, query_meta)]
+            # Strict filter: when the query is anchored to a company, drop
+            # cross-company chunks entirely instead of merely demoting them.
+            # The previous "demote, don't drop" behavior let cross-company
+            # chunks survive past top_k and get cited by the synthesis stage
+            # (e.g., AMD content cited under an AMEX query). Fall back to the
+            # demote-only behavior if strict filtering would empty the pool.
+            matched = [node for node in reranked_nodes if self._node_matches_company(node, query_meta)]
+            if matched:
+                reranked_nodes = matched
+            else:
+                logger.info(
+                    "Company filter would empty candidate pool (keys=%s); "
+                    "falling back to demote-only ordering.",
+                    sorted(company_keys),
+                )
 
         final_nodes = [
             node for node in reranked_nodes

@@ -12,7 +12,6 @@ the loop-driving pieces; per-concern mixins live in sibling modules:
 - context.py        — Context excerpt + atomization + packing + validation
 - synthesis.py      — Final answer + forced retrace (lazy-answer guard)
 - calculator.py     — Deterministic arithmetic
-- overrides.py      — Domain post-synthesis overrides (FinanceBench-specific)
 """
 import logging
 import time

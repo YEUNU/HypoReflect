@@ -61,9 +61,10 @@ async def load_model():
         model=MODEL_ID,
         tensor_parallel_size=1,
         max_model_len=MAX_MODEL_LEN,
-        enable_prefix_caching=True,
+        enable_prefix_caching=False,
         gpu_memory_utilization=GPU_UTIL,
         attention_backend=ATTENTION_BACKEND,
+        enforce_eager=True,
         trust_remote_code=True,
     )
     

@@ -94,23 +94,21 @@ class Orchestrator:
     # ---------- non-agentic baseline ----------
     @staticmethod
     def _build_simple_answer_prompt(context: str, user_query: str) -> str:
-        # Agentic-OFF retrieval baseline path (paper §4.4). The mode isolates
-        # retrieval quality, so the model must always attempt an answer from
-        # CONTEXT — abstention is intentionally NOT offered. The lazy-answer
-        # guard (paper §3.2.4 line 327) only lives in agentic-ON Reflection.
+        # Agentic-OFF retrieval baseline path (paper §4.4). Single-pass
+        # retrieve-then-answer: only the prompt rules the paper documents
+        # for the baseline are kept here. Anti-abstention,
+        # synonym-equivalence, and assumption-substitution rules that
+        # used to live in this prompt are NOT in the paper baseline and
+        # made the agentic-OFF arm artificially stronger relative to
+        # naive RAG, so they're removed.
         return (
-            "You are a financial analyst answering a question about an SEC filing.\n"
-            "Use ONLY the passages in CONTEXT. Always produce a substantive answer; do not refuse or claim insufficient evidence.\n"
+            "Answer the question using ONLY the passages in CONTEXT.\n"
             "\n"
             "Output rules:\n"
-            "1. Begin the answer with `@@ANSWER:` followed by the substantive answer on the same line.\n"
+            "1. Begin the answer with `@@ANSWER:` followed by the answer on the same line.\n"
             "2. Cite every numeric or factual claim inline as `[[Title, Page X, Chunk Y]]` using the exact IDs printed in CONTEXT.\n"
-            "3. For derived metrics (margin, ratio, growth, YoY change, average), compute from primitive operands present in CONTEXT and show one formula with substituted values, then the final value.\n"
-            "4. Treat synonyms as equivalent: revenue = net sales; capex = purchases of PP&E; net PP&E = property plant and equipment net; net AR = trade accounts receivable net; FCF = CFO - capex.\n"
-            "5. Operands often live in different statements (balance sheet / income statement / cash flow / notes). Combine them as needed.\n"
-            "6. If the question asks whether a metric is true/false (yes/no), give the verdict first, then the supporting numbers.\n"
-            "7. If the requested period or entity is only partially covered in CONTEXT, ground the answer on the closest available evidence, state explicitly what was used, and proceed with the computation rather than refusing.\n"
-            "8. If a numeric operand is genuinely absent, substitute a clearly labeled assumption (e.g., 'assuming FY2022 capex ~ FY2021 disclosed value, $1.6B') and continue - never output 'Insufficient evidence.' as a final answer.\n"
+            "3. For derived metrics, compute from primitive operands present in CONTEXT and show one formula with substituted values, then the final value.\n"
+            "4. If CONTEXT does not contain the evidence needed, output `@@ANSWER: insufficient evidence`.\n"
             "\n"
             f"CONTEXT:\n{context}\n"
             "\n"

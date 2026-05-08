@@ -15,12 +15,18 @@ class Neo4jService:
         self.password = os.environ.get("NEO4J_PASSWORD", "1q2w3e4r")
         
         if Neo4jService._driver is None:
+            # Pool sized for parallel indexing: 16 files × concurrent ops
+            # (HOP ANN reads + doc creation + batch flush + reranker caller)
+            # easily exceeds the prior default of 50, manifesting as
+            # "30s timeout obtaining connection" failures and silently
+            # dropped HOP MERGE writes. Server-side CPU stays ~0.5% so
+            # bottleneck is purely client-pool.
             Neo4jService._driver = AsyncGraphDatabase.driver(
                 self.uri,
                 auth=(self.user, self.password),
                 keep_alive=True,
-                max_connection_pool_size=int(os.environ.get("NEO4J_POOL_SIZE", "50")),
-                connection_acquisition_timeout=30,
+                max_connection_pool_size=int(os.environ.get("NEO4J_POOL_SIZE", "200")),
+                connection_acquisition_timeout=int(os.environ.get("NEO4J_POOL_ACQ_TIMEOUT", "60")),
             )
         self.driver = Neo4jService._driver
 

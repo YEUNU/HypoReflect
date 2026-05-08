@@ -73,9 +73,13 @@ class TraversalMixin:
                 )
 
             reranked = sorted(candidates, key=lambda item: item.get("final_score", 0.0), reverse=True)
-            company_matched = [node for node in reranked if self._node_matches_company(node, search_query_meta)]
-            if company_matched and any((search_query_meta.get("company_keys") or [])):
-                reranked = company_matched + [node for node in reranked if not self._node_matches_company(node, search_query_meta)]
+            if any((search_query_meta.get("company_keys") or [])):
+                company_matched = [node for node in reranked if self._node_matches_company(node, search_query_meta)]
+                # Strict filter when the query is company-anchored: drop
+                # cross-company chunks rather than just demoting them.
+                # Fallback to original (no filter) if strict empties the pool.
+                if company_matched:
+                    reranked = company_matched
 
             gated = [node for node in reranked if node.get("rerank_score", 0.0) >= RAGConfig.RERANKER_THRESHOLD]
             if gated:

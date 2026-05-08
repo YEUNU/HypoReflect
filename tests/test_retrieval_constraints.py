@@ -17,27 +17,36 @@ def test_extract_query_metadata_captures_company_and_year():
     assert meta.get("financial_intent") is True
 
 
-def test_q_plus_quality_gate_requires_entity_period_metric_and_anchor():
+def test_q_plus_quality_gate_accepts_at_least_two_signals():
+    """Q+ quality gate requires >=2 of the 4 signals (entity, period, metric,
+    source anchor). The original 4/4 strict gate was relaxed because it
+    accepted only ~2.8% of generated Q+ in practice and starved the HOP
+    graph; bridge questions about a metric across periods or about a
+    related metric in the same period naturally drop one signal.
+    """
     rag = GraphRAG(strategy="hyporeflect")
     ok = rag._is_high_quality_q_plus(  # noqa: SLF001 - unit test for internal helper
         "For AMD FY2022 cash flow statement, what was operating cash flow?",
         title="AMD_2022_10K",
         chunk_text="Consolidated Statements of Cash Flows",
     )
-    bad_missing_anchor = rag._is_high_quality_q_plus(  # noqa: SLF001 - unit test for internal helper
+    # 3-signal: missing source anchor in chunk, but entity+period+metric all present.
+    three_signals = rag._is_high_quality_q_plus(  # noqa: SLF001
         "For AMD FY2022 what was operating cash flow?",
         title="AMD_2022_10K",
         chunk_text="Narrative risk factors section only.",
     )
-    bad_missing_entity = rag._is_high_quality_q_plus(  # noqa: SLF001 - unit test for internal helper
-        "For FY2022 cash flow statement, what was operating cash flow?",
+    # 1-signal: only the period token; chunk text lacks the anchor, the
+    # question lacks both entity and metric tokens.
+    one_signal = rag._is_high_quality_q_plus(  # noqa: SLF001
+        "For FY2022, what changed?",
         title="AMD_2022_10K",
-        chunk_text="Consolidated Statements of Cash Flows",
+        chunk_text="Narrative risk factors section only.",
     )
 
     assert ok is True
-    assert bad_missing_anchor is False
-    assert bad_missing_entity is False
+    assert three_signals is True
+    assert one_signal is False
 
 
 @pytest.mark.asyncio
@@ -128,6 +137,8 @@ async def test_build_graph_filters_q_plus_by_quality_gate():
     rag._ensure_index_ready = AsyncMock(return_value=None)  # type: ignore[method-assign]
     rag.llm.get_embeddings = AsyncMock(side_effect=lambda texts: [[0.1] for _ in texts])
 
+    # Two Q+ candidates: one has all 4 signals (passes), one has 1 signal
+    # (period only — under the relaxed 2-of-4 gate this is still rejected).
     knowledge = {
         "chunks": [
             {
@@ -137,7 +148,7 @@ async def test_build_graph_filters_q_plus_by_quality_gate():
                 "page": 1,
                 "q_minus": ["For AMD FY2022, what was operating cash flow?"],
                 "q_plus": [
-                    "For AMD FY2022 what was operating cash flow?",
+                    "For FY2022, what happened?",  # 1 signal (period only)
                     "For AMD FY2022 cash flow statement, what was operating cash flow?",
                 ],
                 "summary": "Cash flow statement summary.",

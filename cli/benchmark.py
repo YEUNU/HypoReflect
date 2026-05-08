@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -116,7 +117,15 @@ async def run_benchmark(
     output_dir: Optional[Path] = None,
     agentic_mode: Optional[str] = None,
     limit: Optional[int] = None,
+    seed: Optional[int] = None,
 ):
+    """Run benchmark once. When `seed` is provided, RAGConfig.LLM_SEED is set
+    so all vLLM/OpenAI chat.completions calls in this run use that seed, and
+    the output directory gets a `seed_<S>` subdir to avoid clobbering other
+    seeds' results. Multi-seed orchestration lives in run_benchmark_multi_seed.
+    """
+    if seed is not None:
+        RAGConfig.LLM_SEED = int(seed)
     normalized_agentic: Optional[str] = None
     if agentic_mode is not None:
         candidate = str(agentic_mode).strip().lower()
@@ -210,12 +219,23 @@ async def run_benchmark(
     if effective_agentic:
         output_results_dir = output_results_dir / f"agentic_{effective_agentic}"
         agentic_suffix = f"_agentic_{effective_agentic}"
+    if seed is not None:
+        output_results_dir = output_results_dir / f"seed_{int(seed)}"
     output_results_dir.mkdir(parents=True, exist_ok=True)
 
     result_file = output_results_dir / f"{strategy}_{corpus_tag}{refl_suffix}{agentic_suffix}{sample_suffix}.json"
     summary: dict[str, Any] = {}
 
-    for idx, item in enumerate(benchmark_data):
+    benchmark_concurrency = max(1, int(os.environ.get("RAG_BENCHMARK_CONCURRENCY", "4")))
+    query_sem = asyncio.Semaphore(benchmark_concurrency)
+    write_lock = asyncio.Lock()
+    total_queries = len(benchmark_data)
+    if benchmark_concurrency > 1:
+        logger.info("Benchmark concurrency: %d queries in flight", benchmark_concurrency)
+
+    async def _process_query(idx: int, item: dict[str, Any]):
+      nonlocal summary
+      async with query_sem:
         original_query = item["query"]
         query = _build_benchmark_query(original_query, item)
         ground_truth = item.get("ground_truth", "")
@@ -314,55 +334,61 @@ async def run_benchmark(
             if not isinstance(result_item.get("hallucination"), (int, float)):
                 result_item["hallucination"] = 1.0 if (answer_attempted > 0.0 and judge_score < 1.0) else 0.0
 
-        results.append(result_item)
-        if category not in category_results:
-            category_results[category] = []
-        category_results[category].append(result_item)
+        async with write_lock:
+            results.append(result_item)
+            if category not in category_results:
+                category_results[category] = []
+            category_results[category].append(result_item)
 
-        error_suffix = " [ERROR]" if result_item.get("error") else ""
-        print(
-            f"[{strategy}] ({idx + 1}/{len(benchmark_data)}) [{category}]{error_suffix} "
-            f"Judge: {metrics['llm_judge_score']:.1f} | Hallu: {result_item.get('hallucination', 0.0):.0f} "
-            f"| DocMatch: {metrics['doc_match']:.0f} | Latency: {latency:.1f}s"
-        )
+            error_suffix = " [ERROR]" if result_item.get("error") else ""
+            print(
+                f"[{strategy}] ({len(results)}/{total_queries}) [{category}]{error_suffix} "
+                f"Judge: {metrics['llm_judge_score']:.1f} | Hallu: {result_item.get('hallucination', 0.0):.0f} "
+                f"| DocMatch: {metrics['doc_match']:.0f} | Latency: {latency:.1f}s"
+            )
 
-        summary = {
-            "strategy": strategy,
-            "corpus_tag": corpus_tag,
-            "dataset": dataset_name,
-            "queries_count": len(results),
-            "total_queries": len(benchmark_data),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "in_progress" if len(results) < len(benchmark_data) else "completed",
-            "ablation": {
-                "table_to_text": RAGConfig.ABLATION_TABLE_TO_TEXT,
-                "adaptive_chunking": RAGConfig.ABLATION_ADAPTIVE_CHUNKING,
-                "rolling_summary": RAGConfig.ABLATION_ROLLING_SUMMARY,
-                "enable_reflection": RAGConfig.ENABLE_AGENT_REFLECTION,
-            },
-        }
-        if effective_agentic:
-            summary["agentic_mode"] = effective_agentic
-        for key in result_item.keys():
-            if isinstance(result_item[key], (int, float)):
-                summary[f"avg_{key}"] = sum(result[key] for result in results) / len(results)
-
-        cat_summaries = {}
-        for cat, cat_list in category_results.items():
-            cat_sum = {"count": len(cat_list)}
+            summary = {
+                "strategy": strategy,
+                "corpus_tag": corpus_tag,
+                "dataset": dataset_name,
+                "queries_count": len(results),
+                "total_queries": total_queries,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "in_progress" if len(results) < total_queries else "completed",
+                "ablation": {
+                    "table_to_text": RAGConfig.ABLATION_TABLE_TO_TEXT,
+                    "adaptive_chunking": RAGConfig.ABLATION_ADAPTIVE_CHUNKING,
+                    "rolling_summary": RAGConfig.ABLATION_ROLLING_SUMMARY,
+                    "enable_reflection": RAGConfig.ENABLE_AGENT_REFLECTION,
+                },
+            }
+            if effective_agentic:
+                summary["agentic_mode"] = effective_agentic
             for key in result_item.keys():
                 if isinstance(result_item[key], (int, float)):
-                    cat_sum[f"avg_{key}"] = sum(result[key] for result in cat_list) / len(cat_list)
-            cat_summaries[cat] = cat_sum
-        summary["category_summaries"] = cat_summaries
-        summary["details"] = results
+                    summary[f"avg_{key}"] = sum(result[key] for result in results) / len(results)
 
-        with open(result_file, "w", encoding="utf-8") as file:
-            json.dump(summary, file, indent=2, ensure_ascii=False)
-        try:
-            _write_model_report_artifacts(summary, result_file)
-        except Exception as exc:
-            logger.warning("Failed to write report artifacts for %s: %s", result_file, exc)
+            cat_summaries = {}
+            for cat, cat_list in category_results.items():
+                cat_sum = {"count": len(cat_list)}
+                for key in result_item.keys():
+                    if isinstance(result_item[key], (int, float)):
+                        cat_sum[f"avg_{key}"] = sum(result[key] for result in cat_list) / len(cat_list)
+                cat_summaries[cat] = cat_sum
+            summary["category_summaries"] = cat_summaries
+            summary["details"] = results
+
+            with open(result_file, "w", encoding="utf-8") as file:
+                json.dump(summary, file, indent=2, ensure_ascii=False)
+            try:
+                _write_model_report_artifacts(summary, result_file)
+            except Exception as exc:
+                logger.warning("Failed to write report artifacts for %s: %s", result_file, exc)
+
+    await asyncio.gather(
+        *[_process_query(i, it) for i, it in enumerate(benchmark_data)],
+        return_exceptions=False,
+    )
 
     if not results:
         return None
@@ -422,3 +448,171 @@ async def run_benchmark(
     print(f"\n  Final results saved to: {result_file}")
     print(f"{'=' * 50}\n")
     return summary
+
+
+def _parse_seeds_env(raw: str) -> list[int]:
+    """Parse comma/space-separated seed list. Empty -> []."""
+    out: list[int] = []
+    for token in re.split(r"[,\s]+", (raw or "").strip()):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except ValueError:
+            logger.warning("Ignoring non-integer seed token: %r", token)
+    return out
+
+
+def _aggregate_seed_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mean / std / 95% CI per metric across N seeds.
+
+    CI = mean ± 1.96 * std / sqrt(N)  (normal-approx; fine for N>=3 + smooth metrics).
+    Per-category aggregates are computed only over keys that appear in every seed.
+    """
+    import math
+
+    def _agg_keys(values: list[float]) -> dict[str, float]:
+        n = len(values)
+        if n == 0:
+            return {"mean": 0.0, "std": 0.0, "ci95_low": 0.0, "ci95_high": 0.0, "n": 0}
+        mean = sum(values) / n
+        if n == 1:
+            return {"mean": mean, "std": 0.0, "ci95_low": mean, "ci95_high": mean, "n": 1}
+        var = sum((x - mean) ** 2 for x in values) / (n - 1)
+        std = math.sqrt(var)
+        margin = 1.96 * std / math.sqrt(n)
+        return {"mean": mean, "std": std, "ci95_low": mean - margin, "ci95_high": mean + margin, "n": n}
+
+    if not summaries:
+        return {}
+
+    avg_keys = sorted({k for s in summaries for k in s.keys() if k.startswith("avg_")})
+    overall: dict[str, Any] = {}
+    for key in avg_keys:
+        vals = [_safe_float(s.get(key, 0.0), 0.0) for s in summaries if key in s]
+        overall[key] = _agg_keys(vals)
+
+    # Category-level aggregation: only categories that all seeds reported
+    common_cats: Optional[set[str]] = None
+    for s in summaries:
+        cats = set((s.get("category_summaries") or {}).keys())
+        common_cats = cats if common_cats is None else (common_cats & cats)
+    common_cats = common_cats or set()
+
+    categories: dict[str, dict[str, Any]] = {}
+    for cat in sorted(common_cats):
+        cat_keys = sorted({
+            k
+            for s in summaries
+            for k in (s.get("category_summaries", {}).get(cat, {}) or {}).keys()
+            if k.startswith("avg_")
+        })
+        per_cat = {}
+        for key in cat_keys:
+            vals = [
+                _safe_float(s["category_summaries"][cat].get(key, 0.0), 0.0)
+                for s in summaries
+                if cat in (s.get("category_summaries") or {})
+            ]
+            per_cat[key] = _agg_keys(vals)
+        per_cat["count"] = int(summaries[0].get("category_summaries", {}).get(cat, {}).get("count", 0))
+        categories[cat] = per_cat
+
+    return {"overall": overall, "categories": categories}
+
+
+async def run_benchmark_multi_seed(
+    queries_file: str,
+    strategy: str,
+    model_id: str,
+    seeds: Optional[list[int]] = None,
+    is_batch: bool = False,
+    sample_companies: Optional[list[str]] = None,
+    corpus_tag: str = "default",
+    output_dir: Optional[Path] = None,
+    agentic_mode: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """Run the benchmark once per seed, then write a `seeds_aggregate.json`
+    with mean/std/95%-CI per metric. When seeds is empty/None, behaves
+    identically to a single run_benchmark() call.
+    """
+    if seeds is None:
+        seeds = _parse_seeds_env(os.environ.get("RAG_BENCHMARK_SEEDS", ""))
+
+    if not seeds:
+        return await run_benchmark(
+            queries_file=queries_file,
+            strategy=strategy,
+            model_id=model_id,
+            is_batch=is_batch,
+            sample_companies=sample_companies,
+            corpus_tag=corpus_tag,
+            output_dir=output_dir,
+            agentic_mode=agentic_mode,
+            limit=limit,
+        )
+
+    # Pin a single timestamp across all seeds so they share one result root.
+    if not os.environ.get("RAG_BENCHMARK_TIMESTAMP"):
+        os.environ["RAG_BENCHMARK_TIMESTAMP"] = time.strftime("%Y%m%d_%H%M%S")
+
+    summaries: list[dict[str, Any]] = []
+    for s in seeds:
+        logger.info("=== Seed %d (%d/%d) ===", s, len(summaries) + 1, len(seeds))
+        summary = await run_benchmark(
+            queries_file=queries_file,
+            strategy=strategy,
+            model_id=model_id,
+            is_batch=is_batch,
+            sample_companies=sample_companies,
+            corpus_tag=corpus_tag,
+            output_dir=output_dir,
+            agentic_mode=agentic_mode,
+            limit=limit,
+            seed=s,
+        )
+        if summary is not None:
+            summary["_seed"] = s
+            summaries.append(summary)
+
+    if not summaries:
+        return None
+
+    # Reconstruct the seed-parent dir from the first summary's path: result
+    # files live at .../seed_<S>/<file>.json and we want the parent of seed_<S>.
+    timestamp = os.environ.get("RAG_BENCHMARK_TIMESTAMP") or time.strftime("%Y%m%d_%H%M%S")
+    parent_root = (output_dir or (Path("data/results") / timestamp))
+    seeds_root = parent_root / strategy / corpus_tag
+    if strategy.lower() == "hyporeflect":
+        seeds_root = seeds_root / ("refl_on" if RAGConfig.ENABLE_AGENT_REFLECTION else "refl_off")
+    env_agentic = str(os.environ.get("RAG_AGENTIC_MODE", "") or "").strip().lower()
+    if env_agentic in {"on", "off"}:
+        seeds_root = seeds_root / f"agentic_{env_agentic}"
+
+    aggregate = _aggregate_seed_summaries(summaries)
+    payload = {
+        "strategy": strategy,
+        "corpus_tag": corpus_tag,
+        "seeds": seeds,
+        "n_seeds": len(summaries),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "aggregate": aggregate,
+    }
+    seeds_root.mkdir(parents=True, exist_ok=True)
+    out_path = seeds_root / "seeds_aggregate.json"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+    print(f"\n{'=' * 50}")
+    print(f"[{strategy.upper()}] Multi-seed Aggregate (N={len(summaries)} seeds={seeds})")
+    print(f"{'=' * 50}")
+    for key, stats in aggregate.get("overall", {}).items():
+        print(
+            f"  {key}: {stats['mean']:.4f} ± {stats['std']:.4f}  "
+            f"(95%CI [{stats['ci95_low']:.4f}, {stats['ci95_high']:.4f}], n={stats['n']})"
+        )
+    print(f"\n  Aggregate saved to: {out_path}")
+    print(f"{'=' * 50}\n")
+    return payload

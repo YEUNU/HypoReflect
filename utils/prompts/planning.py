@@ -118,10 +118,13 @@ Rules:
 6. For compute queries: when required slots are grounded, call `calculator` with one explicit expression; use precision from QUERY_STATE.rounding when available.
 7. Treat C1-violating evidence as non-evidence and continue retrieval.
 8. Stop when all required slots are grounded and computation is resolved.
+9. TOOL_HISTORY shows prior tool calls and their outcomes (new_entries, reject_reasons). Do NOT repeat a graph_search with the same `entities` set (in any order) when the prior call yielded 0 new ledger entries — vary entities (add metric synonyms, alternate line-item names, change source_anchor) or change top_k. If all prior attempts failed similarly, switch to a different missing slot before retrying.
 QUERY_STATE:
 {query_state}
 MISSING_SLOTS:
 {missing_slots}
+TOOL_HISTORY:
+{tool_history}
 CURRENT CONTEXT:
 {context}
 """.replace("<<FINANCE_CONSTRAINT_CODES>>", _FINANCE_CONSTRAINT_CODES)
@@ -137,10 +140,13 @@ Rules:
 5. Do not invent dates, document types, or statement anchors that are absent from the query.
 6. Treat off-topic or weakly related evidence as non-evidence and continue retrieval.
 7. Stop when the answer is directly supported by grounded evidence or the remaining gap is explicit.
+8. TOOL_HISTORY shows prior tool calls and outcomes (new_entries, reject_reasons). Do not repeat a graph_search with the same `entities` set when the prior call yielded 0 new ledger entries; vary terms or change top_k.
 QUERY_STATE:
 {query_state}
 MISSING_SLOTS:
 {missing_slots}
+TOOL_HISTORY:
+{tool_history}
 CURRENT CONTEXT:
 {context}
 """

@@ -15,6 +15,7 @@ from models.hyporeflect.stages.common import (
     CITATION_RE,
     NUMERIC_METRIC_KEYS,
     NUMERIC_QUERY_MARKERS,
+    answer_matches_calc_result,
     extract_first_number,
     missing_data_policy,
 )
@@ -169,21 +170,7 @@ class ReflectionHandler:
         return metric_key in NUMERIC_METRIC_KEYS
 
     def _answer_matches_calc_result(self, answer: str, calc_result: str) -> bool:
-        answer_text = str(answer or "").strip().replace(",", "")
-        result_text = str(calc_result or "").strip().replace(",", "")
-        if not answer_text or not result_text:
-            return False
-        if result_text in answer_text:
-            return True
-        answer_num = extract_first_number(answer_text)
-        result_num = extract_first_number(result_text)
-        if answer_num is None or result_num is None:
-            return False
-        decimals = 0
-        if "." in result_text:
-            decimals = len(result_text.rsplit(".", 1)[1])
-        tolerance = 10 ** (-(decimals + 1)) if decimals > 0 else 1e-6
-        return abs(answer_num - result_num) <= tolerance
+        return answer_matches_calc_result(answer, calc_result)
 
     @staticmethod
     def _latest_calculator_result(state: AgentState) -> str:

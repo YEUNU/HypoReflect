@@ -1003,25 +1003,6 @@ def test_apply_query_state_heuristics_promotes_boolean_and_list():
     assert list_qs.get("answer_type") == "list"
 
 
-def test_apply_query_state_heuristics_adds_driver_slot():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    qs = handler._apply_query_state_heuristics(  # noqa: SLF001
-        query="What drove operating margin change as of FY2022 for 3M?",
-        query_state={
-            "entity": "3M",
-            "period": "FY2022",
-            "metric": "operating margin",
-            "answer_type": "extract",
-            "required_slots": [
-                {"entity": "3m", "period": "fy2022", "metric": "operating margin"},
-            ],
-        },
-    )
-    slots = qs.get("required_slots", [])
-    assert isinstance(slots, list)
-    assert any("change drivers" in str((slot or {}).get("metric", "")) for slot in slots if isinstance(slot, dict))
-
-
 def test_apply_query_state_heuristics_relaxes_dividend_anchor():
     handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
     qs = handler._apply_query_state_heuristics(  # noqa: SLF001
@@ -1093,77 +1074,6 @@ def test_apply_query_state_heuristics_maps_multi_statement_anchors_by_slot_metri
     }
     assert slot_anchor_by_metric.get("revenue") == "income statement"
     assert slot_anchor_by_metric.get("capital expenditure") == "cash flow statement"
-
-
-def test_apply_query_state_heuristics_quick_ratio_prefers_direct_metric_slot():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    qs = handler._apply_query_state_heuristics(  # noqa: SLF001
-        query=(
-            "Does 3M have a reasonably healthy liquidity profile based on its quick ratio for "
-            "Q2 of FY2023?"
-        ),
-        query_state={
-            "entity": "3M",
-            "period": "Q2 of FY2023",
-            "metric": "quick ratio",
-            "answer_type": "extract",
-            "source_anchor": "balance sheet",
-            "required_slots": [
-                {
-                    "entity": "3m",
-                    "period": "q2 of fy2023",
-                    "metric": "current assets",
-                    "source_anchor": "balance sheet",
-                },
-                {
-                    "entity": "3m",
-                    "period": "q2 of fy2023",
-                    "metric": "current liabilities",
-                    "source_anchor": "balance sheet",
-                },
-            ],
-        },
-    )
-    assert qs.get("metric") == "quick ratio"
-    assert qs.get("source_anchor") is None
-    slots = qs.get("required_slots", [])
-    assert isinstance(slots, list) and len(slots) == 1
-    assert isinstance(slots[0], dict)
-    assert slots[0].get("metric") == "quick ratio"
-
-
-def test_apply_query_state_heuristics_capital_intensity_promotes_boolean_and_capex_revenue_slots():
-    handler = ExecutionHandler(llm=MagicMock(), grag=MagicMock())
-    qs = handler._apply_query_state_heuristics(  # noqa: SLF001
-        query="Is CVS Health a capital-intensive business based on FY2022 data?",
-        query_state={
-            "entity": "CVS Health",
-            "period": "FY2022",
-            "metric": "capital intensity",
-            "answer_type": "compute",
-            "required_slots": [
-                {
-                    "entity": "cvs health",
-                    "period": "fy2022",
-                    "metric": "total assets",
-                    "source_anchor": "balance sheet",
-                },
-                {
-                    "entity": "cvs health",
-                    "period": "fy2022",
-                    "metric": "total capital expenditures",
-                    "source_anchor": "cash flow statement",
-                },
-            ],
-        },
-    )
-    assert qs.get("answer_type") == "boolean"
-    assert qs.get("metric") == "capital intensity"
-    slots = qs.get("required_slots", [])
-    assert isinstance(slots, list) and len(slots) == 2
-    slot_metrics = {str(slot.get("metric", "")) for slot in slots if isinstance(slot, dict)}
-    assert "capital expenditures" in slot_metrics
-    assert "revenue" in slot_metrics
 
 
 def test_extract_textual_tool_calls_parses_multiple_calls():

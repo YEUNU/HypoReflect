@@ -178,16 +178,42 @@ start_gen() {
     fi
 
     echo "Starting Generation Server (Port 28000)..."
+    # GPU 1 layout: gen 0.40 + rerank 0.40 = 0.80 (~25.6 GiB / 32 GiB target).
+    # max-len reduced to 16384 (indexing prompts fit easily; 32K wasted KV).
     CUDA_VISIBLE_DEVICES=1 nohup .venv/bin/vllm serve Qwen/Qwen3-4B-Instruct-2507 \
         --served-model-name generation-model \
         --host 0.0.0.0 \
         --port 28000 \
-        --gpu-memory-utilization 0.55 \
-        --max-model-len 32768 \
+        --gpu-memory-utilization 0.40 \
+        --max-model-len 16384 \
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_xml \
         --attention-backend FLASHINFER \
         --trust-remote-code > logs/vllm_gen.log 2>&1 &
+}
+
+start_gen2() {
+    if is_vllm_server_up 28010; then
+        echo "✅ Generation Server #2 is already UP"
+        return 0
+    fi
+
+    if is_port_in_use 28010; then
+        echo "✅ Generation Server #2 is already running (port 28010 in use)"
+        return 0
+    fi
+
+    echo "Starting Generation Server #2 (Port 28010, GPU 0)..."
+    CUDA_VISIBLE_DEVICES=0 nohup .venv/bin/vllm serve Qwen/Qwen3-4B-Instruct-2507 \
+        --served-model-name generation-model \
+        --host 0.0.0.0 \
+        --port 28010 \
+        --gpu-memory-utilization 0.50 \
+        --max-model-len 16384 \
+        --enable-auto-tool-choice \
+        --tool-call-parser qwen3_xml \
+        --attention-backend FLASHINFER \
+        --trust-remote-code > logs/vllm_gen2.log 2>&1 &
 }
 
 start_ocr() {
@@ -227,13 +253,18 @@ start_embed() {
     fi
 
     echo "Starting Embedding Server (Port 18082)..."
+    # GPU 0 layout: gen2 0.40 + embed 0.40 = 0.80.
+    # vllm computes "available KV" using free GPU memory at engine init, so it
+    # subtracts memory already taken by gen2. Need util high enough that
+    # (target_alloc - model_weights) is comfortably positive.
     CUDA_VISIBLE_DEVICES=0 nohup .venv/bin/vllm serve Qwen/Qwen3-Embedding-0.6B \
         --served-model-name embedding-model \
         --host 0.0.0.0 \
         --port 18082 \
         --gpu-memory-utilization 0.40 \
-        --max-model-len 16384 \
-        --attention-backend FLASHINFER \
+        --max-model-len 8192 \
+        --no-enable-prefix-caching \
+        --enforce-eager \
         --trust-remote-code > logs/embedding.log 2>&1 &
 }
 
@@ -251,7 +282,10 @@ start_rerank() {
     echo "Starting Reranker Service (Port 18083)..."
     export RERANKER_MODEL_ID="Qwen/Qwen3-Reranker-0.6B"
     export RERANKER_GPU_ID=1
-    export RERANKER_GPU_UTIL=0.25
+    # GPU 1 layout: gen 0.40 + rerank 0.40 = 0.80.
+    # Need enough headroom so KV cache calc stays positive after vllm subtracts
+    # the memory gen already claimed.
+    export RERANKER_GPU_UTIL=0.40
     export RERANKER_MAX_MODEL_LEN=4096
     export RERANKER_ATTENTION_BACKEND="FLASHINFER"
     nohup .venv/bin/uvicorn third_party.backend_reranker.main:app --host 0.0.0.0 --port 18083 > logs/reranker.log 2>&1 &
@@ -260,18 +294,20 @@ start_rerank() {
 case $SERVICE in
     neo4j)  start_neo4j ;;
     gen)    start_gen ;;
+    gen2)   start_gen2 ;;
     ocr)    start_ocr ;;
     embed)  start_embed ;;
     rerank) start_rerank ;;
     all)
         start_neo4j
         start_gen
+        start_gen2
         start_ocr
         start_embed
         start_rerank
         ;;
     *)
-        echo "Usage: $0 {neo4j|gen|ocr|embed|rerank|all}"
+        echo "Usage: $0 {neo4j|gen|gen2|ocr|embed|rerank|all}"
         exit 1
         ;;
 esac

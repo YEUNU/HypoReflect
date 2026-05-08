@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from cli.benchmark import run_benchmark
+from cli.benchmark import run_benchmark, run_benchmark_multi_seed
 from cli.index import run_indexing
 from models.hyporeflect.indexing.ocr import run_ocr
 from core.neo4j_service import Neo4jService
@@ -149,7 +149,7 @@ async def main():
             await run_indexing(args.dataset, args.strategy, args.model, args.corpus_tag, args.save_intermediate, sample_companies, args.save_to)
         elif args.mode == "benchmark":
             corpus_tag = _resolve_benchmark_corpus_tag(args, sample_mode)
-            await run_benchmark(args.queries_file, args.strategy, args.model, sample_companies=sample_companies, corpus_tag=corpus_tag, agentic_mode=args.agentic, limit=args.limit)
+            await run_benchmark_multi_seed(args.queries_file, args.strategy, args.model, sample_companies=sample_companies, corpus_tag=corpus_tag, agentic_mode=args.agentic, limit=args.limit)
         elif args.mode == "benchmark_all":
             corpus_tag = _resolve_benchmark_corpus_tag(args, sample_mode)
             env_ts = os.environ.get("RAG_BENCHMARK_TIMESTAMP")
@@ -159,7 +159,7 @@ async def main():
             logger.info("Batch benchmark results will be saved to: %s", results_dir)
             for strategy in ["naive", "hyporeflect", "hoprag", "ms_graphrag"]:
                 print(f"\n>>> Running Benchmark for: {strategy.upper()}")
-                await run_benchmark(args.queries_file, strategy, args.model, is_batch=True, sample_companies=sample_companies, corpus_tag=corpus_tag, output_dir=results_dir, agentic_mode=args.agentic, limit=args.limit)
+                await run_benchmark_multi_seed(args.queries_file, strategy, args.model, is_batch=True, sample_companies=sample_companies, corpus_tag=corpus_tag, output_dir=results_dir, agentic_mode=args.agentic, limit=args.limit)
         elif args.mode == "ocr":
             await run_ocr(args.pdf_dir, args.ocr_output, convert_tables=args.convert_tables, sample_companies=sample_companies)
     finally:

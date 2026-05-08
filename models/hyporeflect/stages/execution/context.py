@@ -1,11 +1,9 @@
 """Context excerpt building, atomization, packing, numeric/period validation
 (paper §3.2.3 evidence-context preparation)."""
-from typing import Any
 from typing import Any, Optional
 import logging
 import math
 import re
-from models.hyporeflect.stages.common import CITATION_RE
 from models.hyporeflect.stages.common import CITATION_RE, NUMERIC_METRIC_KEYS, NUMERIC_QUERY_MARKERS
 from models.hyporeflect.stages.llm_json import compact_json, generate_json_with_retries
 from models.hyporeflect.trace import append_trace

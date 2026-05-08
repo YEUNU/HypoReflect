@@ -76,74 +76,14 @@ class QueryStateSupport:
                         struct.pop('source_anchor', None)
                     relaxed_slots.append(struct)
                 adjusted['required_slots'] = relaxed_slots
-        if 'quick ratio' in metric_key or 'quick ratio' in query_lower:
-            adjusted['metric'] = 'quick ratio'
-            if re.match('^(is|are|was|were|does|do|did|has|have|can|could|should|would)\\b', query_lower):
-                adjusted['answer_type'] = 'boolean'
-            base_entity = str(adjusted.get('entity', '') or '').strip().lower()
-            base_period = str(adjusted.get('period', '') or '').strip().lower()
-            quick_slot: dict[str, Any] = {'metric': 'quick ratio'}
-            if base_entity:
-                quick_slot['entity'] = base_entity
-            if base_period:
-                quick_slot['period'] = base_period
-            anchor = self._normalize_source_anchor(adjusted.get('source_anchor'))
-            if has_explicit_anchor and anchor:
-                quick_slot['source_anchor'] = anchor
-                adjusted['source_anchor'] = anchor
-            else:
-                adjusted['source_anchor'] = None
-            adjusted['required_slots'] = [quick_slot]
-        if ('capital intensity' in metric_key or 'capital-intensive' in query_lower or 'capital intensive' in query_lower) and re.match('^(is|are|was|were|does|do|did|has|have|can|could|should|would)\\b', query_lower):
-            adjusted['answer_type'] = 'boolean'
-            adjusted['metric'] = 'capital intensity'
-            base_entity = str(adjusted.get('entity', '') or '').strip().lower()
-            base_period = str(adjusted.get('period', '') or '').strip().lower()
-            capex_slot: dict[str, Any] = {'metric': 'capital expenditures'}
-            revenue_slot: dict[str, Any] = {'metric': 'revenue'}
-            if base_entity:
-                capex_slot['entity'] = base_entity
-                revenue_slot['entity'] = base_entity
-            if base_period:
-                capex_slot['period'] = base_period
-                revenue_slot['period'] = base_period
-            capex_slot['source_anchor'] = 'cash flow statement'
-            revenue_slot['source_anchor'] = 'income statement'
-            adjusted['source_anchor'] = None
-            adjusted['required_slots'] = [capex_slot, revenue_slot]
-        driver_intent = any((marker in query_lower for marker in ['what drove', 'what drives', 'driven by', 'driver', 'drivers', 'caused by']))
-        if driver_intent and answer_type in {'extract', 'list'} and metric_text:
-            slot_source_anchor = self._normalize_source_anchor(adjusted.get('source_anchor'))
-            driver_metric = f'{metric_text} change drivers'
-            slots_raw = adjusted.get('required_slots', [])
-            slots = list(slots_raw) if isinstance(slots_raw, list) else []
-            has_driver_slot = False
-            for slot in slots:
-                struct = self._parse_slot_struct(slot)
-                if struct and 'driver' in self._canonical_metric_key(struct.get('metric', '')) and self._metric_matches(struct.get('metric', ''), driver_metric):
-                    has_driver_slot = True
-                    break
-            if not has_driver_slot:
-                driver_slot: dict[str, Any] = {'entity': str(adjusted.get('entity', '') or '').strip().lower(), 'period': str(adjusted.get('period', '') or '').strip().lower(), 'metric': driver_metric.lower()}
-                if slot_source_anchor:
-                    driver_slot['source_anchor'] = slot_source_anchor
-                slots.append(driver_slot)
-                adjusted['required_slots'] = slots
-        if 'exclude' in query_lower and any((tok in query_lower for tok in ['m&a', 'acquisition', 'divestiture'])) and ('segment' in query_lower) and any((tok in metric_key for tok in ['segment growth', 'growth impact'])):
-            adjusted_metric = 'organic sales change by business segment excluding acquisitions/divestitures'
-            adjusted['metric'] = adjusted_metric
-            slots_raw = adjusted.get('required_slots', [])
-            if isinstance(slots_raw, list):
-                rewritten_slots: list[Any] = []
-                for slot in slots_raw:
-                    struct = self._parse_slot_struct(slot)
-                    if not struct:
-                        rewritten_slots.append(slot)
-                        continue
-                    if any((tok in self._canonical_metric_key(struct.get('metric', '')) for tok in ['segment growth', 'growth impact'])):
-                        struct['metric'] = adjusted_metric.lower()
-                    rewritten_slots.append(struct)
-                adjusted['required_slots'] = rewritten_slots
+        # Removed: hardcoded query-class rewrites (quick ratio, capital
+        # intensity, "what drove ..." driver intent, segment-growth-excluding-
+        # M&A) that previously synthesized fixed required_slots based on
+        # phrase matches in the user query. CLAUDE.md states these
+        # FinanceBench-specific overrides were removed during the paper-
+        # aligned refactor. The Planning + QueryState stages already
+        # produce required_slots via the LLM; let those stand without
+        # post-hoc dataset-specific patches.
         return adjusted
 
     def _sanitize_query_state(self, data: Any) -> dict[str, Any]:
@@ -548,18 +488,19 @@ class SlotSupport:
         if not required:
             return []
         ledger_missing = self._compute_missing_slots(query_state, evidence_ledger)
-        if not trust_model_missing:
+        # When the model-reported missing list is not trusted (default), the
+        # ledger-derived view is authoritative.
+        if not trust_model_missing or model_missing_slots is None:
             return ledger_missing
-        if model_missing_slots is None:
-            return ledger_missing
-        if not evidence_ledger and (not trust_model_missing):
-            return required
-        ledger_keys = {self._normalize_slot(slot) for slot in ledger_missing}
+        # When trusted, restrict the missing set to slots the model also
+        # flagged as missing (model_missing_slots ∩ ledger_missing semantics
+        # is implemented by intersecting normalized slot keys; the previous
+        # union path was unreachable because trust_model_missing=True forced
+        # `target_keys = model_keys`).
         model_keys = {self._normalize_slot(slot) for slot in model_missing_slots}
-        target_keys = model_keys if trust_model_missing else ledger_keys | model_keys
-        if not target_keys:
+        if not model_keys:
             return []
-        return [slot for slot in required if self._normalize_slot(slot) in target_keys]
+        return [slot for slot in required if self._normalize_slot(slot) in model_keys]
 
     def _slot_struct_matches(self, candidate: dict[str, str], required: dict[str, str]) -> bool:
         if not isinstance(candidate, dict) or not isinstance(required, dict):

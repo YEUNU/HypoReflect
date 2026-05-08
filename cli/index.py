@@ -106,47 +106,72 @@ async def run_indexing(
                 doc_info_path,
             )
 
-    semaphore = asyncio.Semaphore(RAGConfig.MAX_CONCURRENT_LLM_CALLS)
     # Cap how many files can sit in the post-parse chunking+LLM pipeline
     # simultaneously. Each file's chunker fans out one LLM task per page
     # (page-summary stage is `gather([get_page_summary(p) for p in pages])`),
     # bypassing the per-call semaphore. With 16 files × ~200 pages we'd
-    # schedule ~3,200 concurrent coroutines — GIL contention on the asyncio
-    # loop burned CPU at 100% while never actually hitting vLLM. 4 keeps
-    # the page-summary fan-out around ~800 tasks, which empirically lets the
-    # gen server stay saturated without starving on scheduling overhead.
+    # schedule ~3,200 concurrent coroutines — page-summary fan-out is now
+    # gated inside chunking.py via `page_summary_sem` (RAG_MAX_PARALLEL_PAGES)
+    # and chunk-level fan-out via `chunk_sem` (MAX_CONCURRENT_LLM_CALLS), so
+    # the outer file_semaphore is now the only file-level gate.
     file_concurrency = max(1, int(os.environ.get("RAG_MAX_PARALLEL_FILES", "4")))
     file_semaphore = asyncio.Semaphore(file_concurrency)
-    progress = {"count": 0, "lock": asyncio.Lock()}
+    # `summarize_semaphore` is used at the end of indexing for doc-level
+    # global summaries — kept tied to MAX_CONCURRENT_LLM_CALLS because
+    # those calls don't fan out further inside.
+    summarize_semaphore = asyncio.Semaphore(RAGConfig.MAX_CONCURRENT_LLM_CALLS)
+    progress = {"started": 0, "completed": 0, "lock": asyncio.Lock()}
     processed_docs = []
     failed_files = []
     stats = {"succeeded": 0}
+    progress_step = max(1, int(os.environ.get("RAG_PROGRESS_LOG_STEP", "1")))
+
+    async def _log_progress(stage: str, filename: str):
+        async with progress["lock"]:
+            done = progress["completed"]
+            started = progress["started"]
+            failed = len(failed_files)
+            total = len(files)
+            remaining = total - done
+            if stage == "start":
+                if started % progress_step == 0 or started == total:
+                    logger.info(
+                        "Indexing progress | started=%d/%d completed=%d failed=%d remaining=%d | now: %s",
+                        started, total, done, failed, remaining, filename,
+                    )
+            else:
+                if done % progress_step == 0 or done == total:
+                    logger.info(
+                        "Indexing progress | completed=%d/%d failed=%d remaining=%d | finished: %s",
+                        done, total, failed, remaining, filename,
+                    )
 
     async def process_file(filename: str, content: str, prepared_pages: Optional[dict] = None):
         async with file_semaphore:
-            async with semaphore:
-                async with progress["lock"]:
-                    progress["count"] += 1
-                    if progress["count"] % 10 == 0:
-                        logger.info("Indexing progress: %d/%d", progress["count"], len(files))
+            async with progress["lock"]:
+                progress["started"] += 1
+            await _log_progress("start", filename)
 
-                try:
-                    if is_graph:
-                        knowledge = await engine.extract_knowledge(
-                            content, prepared_pages=prepared_pages
-                        )
-                        doc_id = await engine.create_document_node(filename, {"title": knowledge["title"]})
-                        await engine.build_graph(knowledge, source=filename, document_filename=doc_id)
-                        async with progress["lock"]:
-                            processed_docs.append(doc_id)
-                    else:
-                        await engine.index_document(filename, content)
+            try:
+                if is_graph:
+                    knowledge = await engine.extract_knowledge(
+                        content, prepared_pages=prepared_pages
+                    )
+                    doc_id = await engine.create_document_node(filename, {"title": knowledge["title"]})
+                    await engine.build_graph(knowledge, source=filename, document_filename=doc_id)
                     async with progress["lock"]:
-                        stats["succeeded"] += 1
-                except Exception as exc:
-                    logger.error("Failed to index file %s: %s", filename, exc)
-                    async with progress["lock"]:
-                        failed_files.append((filename, str(exc)))
+                        processed_docs.append(doc_id)
+                else:
+                    await engine.index_document(filename, content)
+                async with progress["lock"]:
+                    stats["succeeded"] += 1
+                    progress["completed"] += 1
+            except Exception as exc:
+                logger.error("Failed to index file %s: %s", filename, exc)
+                async with progress["lock"]:
+                    failed_files.append((filename, str(exc)))
+                    progress["completed"] += 1
+            await _log_progress("done", filename)
 
     file_contents = []
     for filename in files:
@@ -192,10 +217,22 @@ async def run_indexing(
 
     if is_graph:
         await engine.flush_graph_batch()
+
+        # One-shot HOP edge construction over the complete graph (paper
+        # §3.1.4). Done after all chunks/embeddings are written so every
+        # source chunk has the same candidate pool. Strategies that don't
+        # use HOP (e.g., naive_rag) won't have this method.
+        if hasattr(engine, "build_all_hop_edges"):
+            try:
+                await engine.build_all_hop_edges()
+            except Exception as exc:
+                logger.error("HOP edge construction failed: %s", exc)
+                failed_files.append(("__hop_edges__", f"hop_error: {exc}"))
+
         logger.info("Summarizing %d documents...", len(processed_docs))
 
         async def summarize_with_semaphore(doc_id):
-            async with semaphore:
+            async with summarize_semaphore:
                 try:
                     await engine.summarize_document(doc_id)
                 except Exception as exc:

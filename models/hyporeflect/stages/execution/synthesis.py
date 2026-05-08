@@ -1,6 +1,5 @@
 """Final answer synthesis + lazy-answer guard / forced retrace
 (paper §3.2.3 'Query Rewriting and Forced Synthesis')."""
-from typing import Any
 from typing import Any, Optional
 import logging
 import time
@@ -51,7 +50,62 @@ class SynthesisSupport:
 
     def _build_expansion_messages(self, state: AgentState) -> list[dict[str, str]]:
         context_tail = self._extract_relevant_span(state.context, query_state=state.query_state, max_chars=min(self.context_char_budget, 3200)) if state.context else ''
-        return [{'role': 'system', 'content': self._agent_execution_prompt_template().format(query_state=self._compact_json(state.query_state, max_chars=900), missing_slots=self._compact_json(state.missing_slots, max_chars=600), context=context_tail if context_tail.strip() else 'No retrieved context yet.')}, {'role': 'user', 'content': f'Query: {state.user_query}\nPlan: {state.plan}'}]
+        tool_history = self._format_tool_history(state)
+        return [{'role': 'system', 'content': self._agent_execution_prompt_template().format(query_state=self._compact_json(state.query_state, max_chars=900), missing_slots=self._compact_json(state.missing_slots, max_chars=600), tool_history=tool_history, context=context_tail if context_tail.strip() else 'No retrieved context yet.')}, {'role': 'user', 'content': f'Query: {state.user_query}\nPlan: {state.plan}'}]
+
+    @staticmethod
+    def _format_tool_history(state: AgentState) -> str:
+        """Compact summary of prior execution-turn tool calls + their ledger
+        outcomes, fed to the next turn's system prompt so the model does not
+        blindly retry the same search after it returned 0 new entries.
+
+        Pulls from `state.trace`: pairs `execution_turn_X` (tool call) with
+        `ledger_update_X` (outcome). Limits to the last 3 turns and ~700 chars
+        to keep prompt overhead small.
+        """
+        if not getattr(state, 'trace', None):
+            return 'none'
+        turn_calls: dict[int, str] = {}
+        turn_outcomes: dict[int, dict[str, Any]] = {}
+        for entry in state.trace:
+            step = str(entry.get('step', '') or '')
+            if step.startswith('textual_tool_calls_parsed_'):
+                try:
+                    turn = int(step.rsplit('_', 1)[-1])
+                except ValueError:
+                    continue
+                turn_calls[turn] = str(entry.get('input') or '')[:240]
+            elif step.startswith('execution_turn_') and step.replace('execution_turn_', '').isdigit():
+                turn = int(step.replace('execution_turn_', ''))
+                if turn not in turn_calls:
+                    turn_calls[turn] = str(entry.get('output') or '')[:240]
+            elif step.startswith('ledger_update_'):
+                try:
+                    turn = int(step.rsplit('_', 1)[-1])
+                except ValueError:
+                    continue
+                out = entry.get('output') or {}
+                if isinstance(out, dict):
+                    diag = out.get('ledger_debug') or {}
+                    reject = diag.get('reject_reasons') if isinstance(diag, dict) else None
+                    turn_outcomes[turn] = {
+                        'new_entries': out.get('new_entries', 0),
+                        'reject_reasons': reject if isinstance(reject, dict) else {},
+                        'missing_after': len(out.get('model_missing_slots') or []),
+                    }
+        if not turn_calls:
+            return 'none'
+        recent = sorted(turn_calls.keys())[-3:]
+        lines: list[str] = []
+        for turn in recent:
+            call = turn_calls.get(turn, '')[:200].replace('\n', ' ')
+            out = turn_outcomes.get(turn) or {}
+            new_entries = out.get('new_entries', 0)
+            reject = out.get('reject_reasons') or {}
+            reject_str = ','.join(f"{k}={v}" for k, v in list(reject.items())[:3]) or 'none'
+            lines.append(f"- turn{turn}: call={call} | new_entries={new_entries} reject={reject_str}")
+        text = '\n'.join(lines)
+        return text[:700] if text else 'none'
 
     def _handle_direct_response(self, state: AgentState, turn: int, resp: Any) -> bool:
         candidate_answer = str(resp)

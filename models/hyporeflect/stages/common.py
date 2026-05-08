@@ -83,3 +83,27 @@ def extract_first_number(text: str) -> float | None:
         return float(match.group(0).replace(",", ""))
     except Exception:
         return None
+
+
+def answer_matches_calc_result(answer: str, calc_result: str) -> bool:
+    """Check whether the calculator result is faithfully reflected in the
+    answer text. Used by both the reflection arithmetic-check pass and the
+    execution synthesis "calculator-direct" gate to keep their decisions
+    consistent. Tolerance scales with the calc result's decimal precision
+    (10^-(decimals+1), or 1e-6 for integer results).
+    """
+    answer_text = str(answer or "").strip().replace(",", "")
+    result_text = str(calc_result or "").strip().replace(",", "")
+    if not answer_text or not result_text:
+        return False
+    if result_text in answer_text:
+        return True
+    answer_num = extract_first_number(answer_text)
+    result_num = extract_first_number(result_text)
+    if answer_num is None or result_num is None:
+        return False
+    decimals = 0
+    if "." in result_text:
+        decimals = len(result_text.rsplit(".", 1)[1])
+    tolerance = 10 ** (-(decimals + 1)) if decimals > 0 else 1e-6
+    return abs(answer_num - result_num) <= tolerance

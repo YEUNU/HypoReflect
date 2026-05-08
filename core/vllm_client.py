@@ -15,10 +15,17 @@ from .config import RAGConfig
 
 class VLLMClient:
     _client_cache = {}
+    # Round-robin counter shared across all VLLMClient instances. Single-threaded
+    # asyncio guarantees safe int increment without a lock.
+    _rr_counter = 0
 
     def __init__(self, model_name: Optional[str] = None):
         self.logger = logging.getLogger(__name__)
         self.vllm_url = RAGConfig.VLLM_URL
+        # All available generation endpoints (VLLM_URL + optional VLLM_URL_2);
+        # the `client` property round-robins across these on every access so a
+        # second vllm serve process on a separate GPU shares the LLM load.
+        self.vllm_urls = list(RAGConfig.VLLM_URLS) or [RAGConfig.VLLM_URL]
         self.ocr_url = RAGConfig.VLLM_OCR_URL
         self.embed_url = RAGConfig.VLLM_EMBED_URL
         self.rerank_url = RAGConfig.VLLM_RERANK_URL
@@ -523,8 +530,18 @@ class VLLMClient:
             self._client_cache[url] = AsyncOpenAI(base_url=url, api_key=self.api_key, timeout=timeout)
         return self._client_cache[url]
 
+    @classmethod
+    def _next_gen_url(cls, urls: List[str]) -> str:
+        """Round-robin pick across configured generation endpoints."""
+        if len(urls) <= 1:
+            return urls[0]
+        idx = cls._rr_counter % len(urls)
+        cls._rr_counter += 1
+        return urls[idx]
+
     @property
-    def client(self): return self._get_cached_client(self.vllm_url)
+    def client(self):
+        return self._get_cached_client(self._next_gen_url(self.vllm_urls))
     @property
     def ocr_client(self): return self._get_cached_client(self.ocr_url)
     @property
@@ -620,6 +637,8 @@ class VLLMClient:
                 params["temperature"] = temperature
             elif apply_default_sampling:
                 params["temperature"] = 0.7
+            if RAGConfig.LLM_SEED is not None:
+                params["seed"] = RAGConfig.LLM_SEED
             if tools: params["tools"] = tools
             if tool_choice: params["tool_choice"] = tool_choice
             if kwargs.get("response_format"): params["response_format"] = kwargs["response_format"]
@@ -729,6 +748,8 @@ class VLLMClient:
                 # Omit temperature for OpenAI models to use their default.
                 if not self._is_openai_model(model):
                     params["temperature"] = 0.0
+                if RAGConfig.LLM_SEED is not None:
+                    params["seed"] = RAGConfig.LLM_SEED
                 if kwargs.get("extra_body") is not None:
                     params["extra_body"] = kwargs["extra_body"]
                 elif not self._is_openai_model(model):

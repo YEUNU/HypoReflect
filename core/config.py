@@ -5,6 +5,12 @@ class RAGConfig:
 
     # --- Infrastructure (Actual ports identified) ---
     VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:28000/v1")
+    # Optional second generation endpoint for round-robin load balancing.
+    # When set (single URL or comma-separated list), the VLLMClient.client
+    # property picks the next URL on every access. Useful when running a
+    # second vllm serve process on a separate GPU.
+    VLLM_URL_2 = os.environ.get("VLLM_URL_2", "").strip()
+    VLLM_URLS = [u.strip() for u in (VLLM_URL + ("," + VLLM_URL_2 if VLLM_URL_2 else "")).split(",") if u.strip()]
     VLLM_EMBED_URL = os.environ.get("VLLM_EMBED_URL", "http://localhost:18082/v1")
     VLLM_OCR_URL = os.environ.get("VLLM_OCR_URL", "http://localhost:28001/v1")
     VLLM_RERANK_URL = os.environ.get("VLLM_RERANK_URL", "http://localhost:18083/v1")
@@ -36,8 +42,15 @@ class RAGConfig:
     LLM_REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "300"))
     LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "5"))
     LLM_RETRY_DELAY = float(os.environ.get("LLM_RETRY_DELAY", "2.0"))
+    # Per-call sampling seed forwarded to vLLM/OpenAI chat.completions when set
+    # (multi-seed benchmarking). Empty/missing => no seed (engine default).
+    _LLM_SEED_RAW = os.environ.get("RAG_LLM_SEED", "").strip()
+    LLM_SEED = int(_LLM_SEED_RAW) if _LLM_SEED_RAW.lstrip("-").isdigit() else None
     MAX_CONTEXT_LENGTH = 65536
-    MAX_OUTPUT_TOKENS = 16384
+    # Capped well below vllm `--max-model-len` (16384) so input has room.
+    # Indexing prompts (chunking, Q-/Q+, summary) rarely exceed 1–2K output;
+    # 4K is comfortable headroom.
+    MAX_OUTPUT_TOKENS = 4096
     MAX_EMBEDDING_LENGTH = int(os.environ.get("MAX_EMBEDDING_LENGTH", "16384"))
     
     # --- RAG & Indexing Settings ---

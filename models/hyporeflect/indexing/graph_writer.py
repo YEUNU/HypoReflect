@@ -24,6 +24,50 @@ from utils.prompts import (
 from .chunking import _make_semantic_chunk_id
 
 
+_COMPANY_ALIASES = {
+    # Typo in the source corpus filename — `ACTIVSIONBLIZZARD_2023Q2_10Q.txt`
+    # is missing an 'I' compared to all other Activision Blizzard filings.
+    # Without normalization, the same-company HOP filter would split this
+    # company into two graph islands.
+    "ACTIVSIONBLIZZARD": "ACTIVISIONBLIZZARD",
+}
+
+
+def _company_from_source(source: str) -> str:
+    """Extract a normalized company key from a FinanceBench filename.
+
+    Filenames follow `<COMPANY>_<YEAR>[Qn]_<FORM>.txt`, e.g.
+      3M_2015_10K.txt                -> 3M
+      JOHNSON_JOHNSON_2023_10K.txt   -> JOHNSON_JOHNSON
+      AMERICANWATERWORKS_2020_10K.txt -> AMERICANWATERWORKS
+      BESTBUY_2023_8K_dated-2023-04-24.txt -> BESTBUY
+      3M_2023Q2_10Q.txt              -> 3M
+      MCDONALDS_8K_dated-2023-...txt -> MCDONALDS  (no year token; falls
+                                                    back to parts[0])
+      Pfizer_2023Q2_10Q.txt          -> PFIZER     (case-normalized)
+      ACTIVSIONBLIZZARD_2023Q2_...txt -> ACTIVISIONBLIZZARD  (typo aliased)
+
+    Splits on `_`, joins all segments before the first segment starting
+    with a 4-digit year token. Multi-word names (with underscores) are
+    preserved. Result is uppercased and run through the alias map so that
+    case-inconsistent filenames (e.g., `Pfizer` vs `PFIZER`) and known
+    typos collapse onto a single company key. Used as the same-company
+    HOP-edge filter (paper §3.1.4) to keep multi-hop bridges intra-entity.
+    """
+    if not source:
+        return ""
+    base = source.rsplit(".", 1)[0]
+    parts = base.split("_")
+    extracted = parts[0]
+    for i, p in enumerate(parts):
+        if re.match(r"^\d{4}", p):  # year token like "2015" or "2023Q2"
+            extracted = "_".join(parts[:i]) if i > 0 else parts[0]
+            break
+
+    normalized = extracted.upper()
+    return _COMPANY_ALIASES.get(normalized, normalized)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,6 +273,7 @@ class GraphWriterMixin:
                 "id": chunk_id,
                 "text": chunk["text"],
                 "source": source,
+                "company": _company_from_source(source),
                 "title": chunk["title"],
                 "sent_id": chunk["sent_id"],
                 "page": chunk.get("page", 0),
@@ -273,7 +318,8 @@ class GraphWriterMixin:
                 WITH d
                 UNWIND $batch AS item
                 MERGE (c:{self.chunk_label} {{id: item.id}})
-                SET c.text = item.text, c.source = item.source, c.title = item.title,
+                SET c.text = item.text, c.source = item.source, c.company = item.company,
+                    c.title = item.title,
                     c.sent_id = item.sent_id, c.page = item.page, c.corpus = $corpus,
                     c.embedding = item.embedding,
                     c.body_embedding = item.body_embedding, c.q_minus_embedding = item.q_minus_embedding,
@@ -289,4 +335,9 @@ class GraphWriterMixin:
                 MERGE (c1)-[:NEXT]->(c2)
             """, {"batch": item["data"]})
 
-        await self._build_hop_edges_from_batch(current_batch)
+        # HOP edge construction is now a single one-shot pass at the end of
+        # indexing (`build_all_hop_edges`), invoked from cli/index.py after
+        # all files have been flushed. The previous per-batch call here
+        # produced an asymmetric graph (early batches had only 24 other
+        # docs as candidates, late batches saw the whole corpus). See
+        # paper §3.1.4: "Multi-hop discovery happens once, at indexing time".

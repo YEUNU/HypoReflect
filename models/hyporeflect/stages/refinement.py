@@ -15,7 +15,7 @@ a substantive cited answer over a bare "insufficient evidence".
 import logging
 import re
 import time
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from core.config import RAGConfig
 from utils.prompts import (
@@ -88,9 +88,21 @@ class RefinementHandler:
             model=self.stage_model,
         )
 
+        citation_preserved = False
         if ok:
             answer, _ = extract_final_answer_from_json(data)
             if answer:
+                # If the draft carried inline citations and the refinement
+                # dropped them all (common when the model only meant to fix
+                # formatting like rounding), splice the draft's citations
+                # back in so the answer remains grounded for downstream
+                # gates. This is generic — does not interpret citation
+                # contents, just preserves them.
+                draft_citations = CITATION_RE.findall(str(state.final_answer or ""))
+                refined_citations = CITATION_RE.findall(answer)
+                if draft_citations and not refined_citations:
+                    answer = answer.rstrip() + " " + " ".join(draft_citations)
+                    citation_preserved = True
                 state.final_answer = answer
         append_trace(
             state.trace,
@@ -99,6 +111,7 @@ class RefinementHandler:
             output={
                 "final_answer": state.final_answer,
                 "attempts": attempts,
+                "citation_preserved_from_draft": citation_preserved,
             },
             duration_ms=(time.perf_counter() - started) * 1000.0,
         )
@@ -161,6 +174,44 @@ class RefinementOrchestrator:
         if not isinstance(issues, list):
             return 0
         return len([str(item).strip() for item in issues if str(item).strip()])
+
+    # Phrases used by the reflection prompt when the grounded draft used
+    # cross-entity / cross-period evidence. Phrases are matched as
+    # substrings (case-insensitive). The constraint codes "C1" / "C8" are
+    # matched separately with a regex that requires a word boundary +
+    # non-word-character lookahead — otherwise unrelated tokens like
+    # "rfc1234" or "c1q3" would falsely trigger.
+    _ENTITY_CRITIQUE_PHRASES: ClassVar[tuple[str, ...]] = (
+        "entity mismatch", "entity/period mismatch",
+        "cross-company", "cross-entity",
+        "wrong entity", "different entity", "different company",
+        "unrelated to", "is unrelated", "are unrelated",
+        "not match the query_state entity",
+        "does not match the query",
+        "cross-company/year",
+        "fabricated citation", "hallucinated",
+    )
+    _ENTITY_CRITIQUE_CODE_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?<![a-z0-9])c(?:1|8)(?:/c?[0-9])?(?![a-z0-9])",
+        flags=re.IGNORECASE,
+    )
+
+    @classmethod
+    def _has_entity_critique_issue(cls, reflection_meta: Optional[dict[str, Any]]) -> bool:
+        if not isinstance(reflection_meta, dict):
+            return False
+        issues = reflection_meta.get("issues")
+        if not isinstance(issues, list):
+            return False
+        for item in issues:
+            text = str(item or "").lower()
+            if not text.strip():
+                continue
+            if any(phrase in text for phrase in cls._ENTITY_CRITIQUE_PHRASES):
+                return True
+            if cls._ENTITY_CRITIQUE_CODE_RE.search(text):
+                return True
+        return False
 
     def _candidate_rank(
         self,
@@ -225,7 +276,24 @@ class RefinementOrchestrator:
         # Hard non-regression guard: never replace a grounded answer with insufficient.
         if (not before_insufficient) and after_insufficient:
             policy = missing_data_policy(state)
+            # Exception: if the grounded `before` was rejected by reflection
+            # specifically for a hallucinated/cross-entity citation, the
+            # "groundedness" is a surface artifact (right-shape citation,
+            # wrong-source content). In that case, an honest "insufficient
+            # evidence" is preferable to preserving a hallucinated answer.
+            # Detection is generic — looks for entity/cross-entity/unsupported
+            # issue keywords from the reflection critique, not domain terms.
+            before_has_entity_issue = (
+                (not before_passed) and self._has_entity_critique_issue(before_meta)
+            )
             if policy in {"inapplicable_explain", "zero_if_not_explicit"}:
+                if before_has_entity_issue:
+                    return True, self._quality_gate_payload(
+                        before_rank=before_rank,
+                        after_rank=after_rank,
+                        keep_after=True,
+                        reason="prefer_insufficient_over_entity_mismatched_grounded",
+                    )
                 return False, self._quality_gate_payload(
                     before_rank=before_rank,
                     after_rank=after_rank,
@@ -240,6 +308,13 @@ class RefinementOrchestrator:
                     after_rank=after_rank,
                     keep_after=False,
                     reason="non_regression_guard_before_grounded_after_insufficient",
+                )
+            if before_has_entity_issue:
+                return True, self._quality_gate_payload(
+                    before_rank=before_rank,
+                    after_rank=after_rank,
+                    keep_after=True,
+                    reason="prefer_insufficient_over_entity_mismatched_grounded",
                 )
             if not after_passed and after_issues < before_issues:
                 return True, self._quality_gate_payload(

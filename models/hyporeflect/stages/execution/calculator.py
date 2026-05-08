@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from utils.prompts import CALCULATION_PLAN_PROMPT, CALCULATION_PLAN_RETRY_PROMPT
 from models.hyporeflect.state import AgentState
-from models.hyporeflect.stages.common import extract_first_number
+from models.hyporeflect.stages.common import answer_matches_calc_result, extract_first_number
 from models.hyporeflect.stages.llm_json import compact_json, generate_json_with_retries
 
 
@@ -410,23 +410,7 @@ class CalculatorSupport:
         return entries
 
     def _answer_matches_calc_result(self, answer: str, calc_result: str) -> bool:
-        answer_text = str(answer or "").strip()
-        result_text = str(calc_result or "").strip()
-        if not answer_text or not result_text:
-            return False
-        normalized_answer = answer_text.replace(",", "")
-        normalized_result = result_text.replace(",", "")
-        if normalized_result in normalized_answer:
-            return True
-        answer_num = extract_first_number(normalized_answer)
-        result_num = extract_first_number(normalized_result)
-        if answer_num is None or result_num is None:
-            return False
-        decimals = 0
-        if "." in normalized_result:
-            decimals = len(normalized_result.rsplit(".", 1)[1])
-        tolerance = 10 ** (-(decimals + 1)) if decimals > 0 else 1e-6
-        return abs(answer_num - result_num) <= tolerance
+        return answer_matches_calc_result(answer, calc_result)
 
     def _build_calc_result_answer(
         self,
