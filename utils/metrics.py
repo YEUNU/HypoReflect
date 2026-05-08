@@ -4,7 +4,7 @@ import string
 from difflib import SequenceMatcher
 from typing import List, Any, Optional
 from core.config import RAGConfig
-from utils.prompts import FINANCEBENCH_HALLUCINATION_PROMPT, FINANCEBENCH_JUDGE_PROMPT
+from utils.prompts import FINANCEBENCH_JUDGE_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -195,53 +195,53 @@ async def evaluate_financebench_response(
 ) -> dict:
     """
     FinanceBench 통합 평가 인터페이스 (LLM-as-a-judge + Evidence Match).
+    Score and hallucination are produced from a SINGLE LLM call so the two
+    judgements stay internally consistent (e.g., score=1.0 ⇒
+    hallucination=0.0; honest abstain ⇒ both 0).
     """
     judge_score = 0.0
     judge_reason = ""
     hallucination = 0.0
     hallucination_reason = ""
     hallucination_source = ""
-    hallucination_model = str(RAGConfig.HALLUCINATION_EVAL_MODEL or "").strip() or RAGConfig.EVAL_MODEL
+    judge_model = RAGConfig.EVAL_MODEL
 
-    def _parse_judge_score(raw_score: Any) -> Optional[float]:
+    def _parse_unit_score(raw: Any) -> Optional[float]:
         try:
-            if raw_score is None:
+            if raw is None:
                 return None
-            score = float(raw_score)
-            return max(0.0, min(1.0, score))
+            value = float(raw)
+            return max(0.0, min(1.0, value))
         except Exception:
             return None
-
-    def _parse_hallucination_score(raw_score: Any, raw_label: Any = None) -> Optional[float]:
-        parsed = _parse_judge_score(raw_score)
-        if parsed is not None:
-            return 1.0 if parsed >= 0.5 else 0.0
-        label = str(raw_label or "").strip().lower()
-        if label in {"hallucinated", "hallucination", "yes", "true", "1"}:
-            return 1.0
-        if label in {"not_hallucinated", "not hallucinated", "no", "false", "0"}:
-            return 0.0
-        return None
 
     def _is_insufficient_text(text: Any) -> bool:
         return "insufficient evidence" in str(text or "").lower()
 
+    def _heuristic_judge() -> tuple[float, str]:
+        fallback_acc = calculate_financebench_accuracy(response, ground_truth)
+        score = max(
+            fallback_acc["exact_match"],
+            fallback_acc["numeric_match"],
+            fallback_acc["contains_match"],
+        )
+        reason = "fallback_heuristic: exact/numeric/contains max"
+        return score, reason
+
+    judge_payload: Optional[dict] = None
     if vllm_client:
         judge_prompt = FINANCEBENCH_JUDGE_PROMPT.format(
             query=query,
             ground_truth=ground_truth,
-            response=response
+            response=response,
         )
         try:
-            # Primary judge model
-            res_json = await vllm_client.generate_json(
+            judge_payload = await vllm_client.generate_json(
                 [{"role": "user", "content": judge_prompt}],
-                model=RAGConfig.EVAL_MODEL
+                model=RAGConfig.EVAL_MODEL,
             )
-            parsed = _parse_judge_score(res_json.get("score"))
-
-            # Fallback to local generation model when judge score is missing/invalid.
-            if parsed is None:
+            parsed_score = _parse_unit_score((judge_payload or {}).get("score"))
+            if parsed_score is None:
                 fallback_model = RAGConfig.DEFAULT_MODEL
                 if fallback_model and fallback_model != RAGConfig.EVAL_MODEL:
                     logger.warning(
@@ -249,97 +249,50 @@ async def evaluate_financebench_response(
                         RAGConfig.EVAL_MODEL,
                         fallback_model,
                     )
-                    res_json = await vllm_client.generate_json(
+                    judge_payload = await vllm_client.generate_json(
                         [{"role": "user", "content": judge_prompt}],
-                        model=fallback_model
+                        model=fallback_model,
                     )
-                    parsed = _parse_judge_score(res_json.get("score"))
-
-            if parsed is not None:
-                judge_score = parsed
-                judge_reason = str(res_json.get("reason", ""))
-            else:
-                # Deterministic fallback instead of hard-zero when judge model is unavailable.
-                fallback_acc = calculate_financebench_accuracy(response, ground_truth)
-                judge_score = max(
-                    fallback_acc["exact_match"],
-                    fallback_acc["numeric_match"],
-                    fallback_acc["contains_match"],
-                )
-                judge_reason = (
-                    "fallback_heuristic: exact/numeric/contains max used due unavailable judge score"
-                )
-                logger.warning(
-                    "LLM judge score unavailable from both primary='%s' and fallback='%s'. "
-                    "Using heuristic score=%.2f",
-                    RAGConfig.EVAL_MODEL,
-                    RAGConfig.DEFAULT_MODEL,
-                    judge_score,
-                )
+                    judge_model = fallback_model
         except Exception as e:
             logger.error(f"LLM Judge failed: {e}")
-            fallback_acc = calculate_financebench_accuracy(response, ground_truth)
-            judge_score = max(
-                fallback_acc["exact_match"],
-                fallback_acc["numeric_match"],
-                fallback_acc["contains_match"],
-            )
-            judge_reason = "fallback_heuristic_after_exception"
-    else:
-        fallback_acc = calculate_financebench_accuracy(response, ground_truth)
-        judge_score = max(
-            fallback_acc["exact_match"],
-            fallback_acc["numeric_match"],
-            fallback_acc["contains_match"],
-        )
-        judge_reason = "fallback_heuristic_without_judge_client"
+            judge_payload = None
 
-    # Hallucination evaluation (GPT-5.2 by default): compare model response vs ground truth.
+    parsed_score = _parse_unit_score((judge_payload or {}).get("score"))
+    parsed_hallu = _parse_unit_score((judge_payload or {}).get("hallucination"))
+
+    if parsed_score is not None:
+        judge_score = parsed_score
+        judge_reason = str((judge_payload or {}).get("reason", "")) or "combined_judge"
+    else:
+        judge_score, judge_reason = _heuristic_judge() if vllm_client else _heuristic_judge()
+        if not vllm_client:
+            judge_reason = "fallback_heuristic_without_judge_client"
+
+    # Resolve hallucination from the same combined call when possible. Apply
+    # the honest-abstain rule deterministically (so the LLM cannot label a
+    # genuine "insufficient evidence" abstention as a hallucination).
     if _is_insufficient_text(response):
         hallucination = 0.0
         hallucination_reason = "non_answer_insufficient"
         hallucination_source = "rule_non_answer"
-    elif str(response or "").strip():
-        if vllm_client:
-            hallucination_prompt = FINANCEBENCH_HALLUCINATION_PROMPT.format(
-                query=query,
-                ground_truth=ground_truth,
-                response=response,
-            )
-            try:
-                hallu_json = await vllm_client.generate_eval_json(
-                    [{"role": "user", "content": hallucination_prompt}],
-                    model=hallucination_model,
-                )
-                parsed_hallucination = _parse_hallucination_score(
-                    hallu_json.get("hallucination"),
-                    hallu_json.get("label"),
-                )
-                if parsed_hallucination is not None:
-                    hallucination = parsed_hallucination
-                    hallucination_reason = str(hallu_json.get("reason", ""))
-                    hallucination_source = "gpt_hallucination_judge"
-                else:
-                    hallucination = 1.0 if judge_score < 1.0 else 0.0
-                    hallucination_reason = "fallback_llm_judge_due_invalid_hallucination_payload"
-                    hallucination_source = "llm_judge_fallback"
-            except Exception as e:
-                logger.warning(
-                    "Hallucination judge failed with model '%s': %s. Falling back to llm_judge_score.",
-                    hallucination_model,
-                    e,
-                )
-                hallucination = 1.0 if judge_score < 1.0 else 0.0
-                hallucination_reason = "fallback_llm_judge_after_hallucination_exception"
-                hallucination_source = "llm_judge_fallback"
-        else:
-            hallucination = 1.0 if judge_score < 1.0 else 0.0
-            hallucination_reason = "fallback_llm_judge_without_judge_client"
-            hallucination_source = "llm_judge_fallback"
-    else:
+    elif not str(response or "").strip():
         hallucination = 0.0
         hallucination_reason = "non_answer_empty"
         hallucination_source = "rule_non_answer"
+    elif parsed_hallu is not None:
+        # 1.0 if the LLM marked any hallucination signal; 0.0 otherwise.
+        hallucination = 1.0 if parsed_hallu >= 0.5 else 0.0
+        hallucination_reason = str((judge_payload or {}).get("reason", "")) or "combined_judge"
+        hallucination_source = "combined_judge"
+    else:
+        # Combined-call payload was unparseable for hallucination; derive from score
+        # to keep the two metrics consistent.
+        hallucination = 1.0 if judge_score < 1.0 else 0.0
+        hallucination_reason = "fallback_llm_judge_due_invalid_payload"
+        hallucination_source = "llm_judge_fallback"
+
+    hallucination_model = judge_model
 
     # Calculate Evidence Match (Doc & Page)
     # Supports dict/list/str source types directly.

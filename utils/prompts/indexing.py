@@ -50,6 +50,31 @@ Rules:
 Original Query: {query}
 """
 
+RERANK_QUERY_SIMPLIFY_PROMPT = """
+Extract the underlying question from a possibly-verbose user query for use as
+a cross-encoder reranker input. The reranker scores chunk-vs-question
+relevance and is hurt by long preludes, role framing, and meta instructions.
+
+Rules:
+1. Preserve every concrete constraint from the original: target entity, period,
+   metric/line-item, statement anchor (e.g., "from cash flow statement"), unit,
+   rounding.
+2. Drop role-play preludes ("Answer as if you are...", "Imagine you are..."),
+   reasoning instructions ("step by step", "show your work"), output-format
+   instructions ("round to one decimal place", "answer in percent"), and
+   editorial prefaces ("According to the details clearly outlined within...").
+3. Output one sentence ending with a question mark.
+4. Do NOT introduce constraints not present in the original query.
+5. If the original is already a single concise question, return it as-is.
+
+Original Query: {query}
+"""
+
+RERANK_QUERY_SIMPLIFY_FORMAT_INSTRUCTION = """
+Output ONLY JSON:
+{{"question": "..."}}
+"""
+
 QUERY_REWRITE_FORMAT_INSTRUCTION = """
 Output ONLY JSON:
 {{"positive_queries": []}}
@@ -57,9 +82,11 @@ Output ONLY JSON:
 
 RERANKER_INSTRUCTION = (
     "Rank the passage by whether it directly answers the query. "
-    "Match the exact entity and period in the query; reject entity or period mismatches. "
-    "Prefer primary statements and note tables that contain the requested line item. "
-    "Treat revenue=net sales, capex=PP&E purchases, net PP&E=property plant and equipment net. "
+    "Match the exact entity, period, and line-item phrasing requested in the query. "
+    "When the query asks about a specific line-item name, prefer passages "
+    "whose tokens for that line item are identical to the query, not merely "
+    "near-synonymous (e.g., a passage reporting 'X expense' is not equivalent "
+    "to one reporting 'X and Y' when the query asks for 'X and Y'). "
     "Down-rank boilerplate."
 )
 

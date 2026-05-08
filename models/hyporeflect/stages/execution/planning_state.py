@@ -841,8 +841,8 @@ class EntitySupport:
             deduped.append(str(item).strip())
         return deduped
 
-    async def _entity_guarded_graph_search(self, *, entities: list[str], depth: int, top_k: int, query_state: dict[str, Any], user_query: str) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-        txt, data = await self._call_graph_search(entities, depth=depth, top_k=top_k)
+    async def _entity_guarded_graph_search(self, *, entities: list[str], depth: int, top_k: int, query_state: dict[str, Any], user_query: str, excluded_chunk_ids: Optional[set[str]] = None) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+        txt, data = await self._call_graph_search(entities, depth=depth, top_k=top_k, user_query=user_query, excluded_chunk_ids=excluded_chunk_ids)
         filtered = self._filter_nodes_by_query_entity(data, query_state, user_query=user_query, fail_open=False)
         diagnostics: dict[str, Any] = {'initial_raw': len(data), 'initial_kept': len(filtered), 'retry_used': False, 'retry_raw': 0, 'retry_kept': 0, 'relaxed_used': False, 'relaxed_kept': 0, 'retry_reason': ''}
         retry_data: list[dict[str, Any]] = []
@@ -863,7 +863,7 @@ class EntitySupport:
             if retry_entities:
                 diagnostics['retry_used'] = True
                 diagnostics['retry_reason'] = 'compute_sparse_year_coverage' if compute_sparse_year_coverage else 'initial_empty'
-                retry_txt, retry_data = await self._call_graph_search(retry_entities, depth=depth, top_k=top_k)
+                retry_txt, retry_data = await self._call_graph_search(retry_entities, depth=depth, top_k=top_k, user_query=user_query, excluded_chunk_ids=excluded_chunk_ids)
                 retry_filtered = self._filter_nodes_by_query_entity(retry_data, query_state, user_query=user_query, fail_open=False)
                 diagnostics['retry_raw'] = len(retry_data)
                 diagnostics['retry_kept'] = len(retry_filtered)

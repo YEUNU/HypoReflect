@@ -15,44 +15,40 @@ REASON: [Short explanation]
 """
 
 FINANCEBENCH_JUDGE_PROMPT = """
-### Task: Evaluate if the Model Prediction is correct based on the Ground Truth Answer.
+### Task: Score the Model Prediction on (a) correctness vs Ground Truth and
+(b) hallucination — with a SINGLE LLM call so the two judgements are
+internally consistent.
 
 **Question:** {query}
 **Ground Truth Answer:** {ground_truth}
 **Model Prediction:** {response}
 
-### Instructions:
-1. The Model Prediction may contain step-by-step reasoning. Locate the FINAL answer:
-   it is typically enclosed in \\boxed{{...}}, follows "Final Answer:", or follows the
-   last "@@ANSWER:" marker. Compare ONLY that final answer against the Ground Truth
-   — ignore intermediate reasoning steps and worked-out arithmetic.
-2. Financial values must match numerically; equivalent unit scaling (million/billion/M) and formatting differences ($, commas, %) are acceptable.
-3. If the final answer provides the correct factual/financial information as the Ground Truth, score it 1.0 (CORRECT).
-4. If the final answer is factually wrong, contradicts the Ground Truth, or provides an incorrect value, score it 0.0 (INCORRECT).
-5. Minor wording differences are okay as long as the core answer is the same.
-6. If the question does not specify precision, treat equivalent values under standard rounding as correct.
-7. Treat "Insufficient evidence." (or equivalent abstention) as 0.0 only when the Ground Truth contains a substantive answer; if the Ground Truth itself reflects "no value / 0 / not disclosed", an abstention may be acceptable.
+### Instructions
+1. Locate the FINAL answer in the Model Prediction (typically inside
+   \\boxed{{...}}, after "Final Answer:", or after the last "@@ANSWER:" marker).
+   Judge on that final answer only — ignore intermediate reasoning and
+   worked-out arithmetic.
+2. Allow equivalent unit scaling (million/billion/M) and formatting
+   differences ($, commas, %, rounding) when the underlying value matches.
+3. score:
+   - 1.0 if the final answer conveys the same factual/financial content
+     as the Ground Truth (minor wording differences ok).
+   - 0.0 if the final answer is factually wrong, contradicts the Ground
+     Truth, or provides an incorrect value.
+   - "Insufficient evidence" / abstention is 0.0 when Ground Truth contains
+     a substantive answer; if Ground Truth itself is "no value / 0 / not
+     disclosed", an abstention is acceptable (1.0).
+4. hallucination:
+   - 1.0 if the final answer asserts wrong/conflicting factual or numeric
+     content.
+   - 0.0 if the final answer is factually consistent with the Ground
+     Truth, or is an honest abstention ("insufficient evidence" / non-
+     answer). An abstention is NOT a hallucination, even when the Ground
+     Truth has a substantive answer.
+5. Internal consistency: hallucination=1.0 implies score=0.0. score=1.0
+   implies hallucination=0.0. score=0.0 with hallucination=0.0 is the
+   honest-abstain case.
 
 Respond ONLY in JSON format:
-{{"score": 1.0 or 0.0, "reason": "brief explanation"}}
-"""
-
-FINANCEBENCH_HALLUCINATION_PROMPT = """
-### Task: Determine whether the Model Prediction is hallucinated against the Ground Truth.
-
-**Question:** {query}
-**Ground Truth Answer:** {ground_truth}
-**Model Prediction:** {response}
-
-### Instructions:
-1. The Model Prediction may contain step-by-step reasoning. Locate the FINAL answer
-   (\\boxed{{...}}, after "Final Answer:", or after the last "@@ANSWER:") and judge
-   hallucination on that final answer only.
-2. Return hallucination=1.0 if the final answer asserts wrong/conflicting factual or numeric content.
-3. Return hallucination=0.0 if the final answer is factually consistent with the Ground Truth.
-4. If the final answer is exactly "insufficient evidence" (or equivalent non-answer), return hallucination=0.0.
-5. Allow equivalent unit scaling/format differences when values are the same.
-
-Respond ONLY in JSON format:
-{{"hallucination": 1.0 or 0.0, "reason": "brief explanation"}}
+{{"score": 1.0 or 0.0, "hallucination": 1.0 or 0.0, "reason": "brief explanation covering both judgements"}}
 """

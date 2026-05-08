@@ -22,7 +22,9 @@ Rules:
 11. If QUERY_STATE.missing_data_policy is inapplicable_explain and context supports metric inapplicability, explain that with citations instead of insufficient evidence.
 12. <<COMPUTE_MISSING_POLICY_LINE>>
 13. For extract/boolean/list queries, required_slots are guidance; if CONTEXT has direct citation-grounded evidence that answers QUERY, answer directly even when some slots remain missing.
-14. For extract/boolean/list queries, output @@ANSWER: insufficient evidence only when direct evidence is absent or conflicting.
+13a. Intent preservation: when the literal compute is blocked because one required operand is missing, BUT CONTEXT contains grounded narrative that addresses the QUERY's underlying intent (drivers, causes, qualitative direction, comparative ranking), answer the underlying intent with citations rather than abstaining. Concretely: a "what drove X change" query should report the cause clauses present in CONTEXT even when the change-magnitude operand is missing; a "is metric Y healthy" query should report the qualitative read present in CONTEXT even when one component of the ratio is missing. Only emit `insufficient evidence` when neither the literal computation nor the underlying intent has any grounded support in CONTEXT.
+13b. No concept substitution: do NOT answer an adjacent question. If QUERY asks segment-by-revenue and CONTEXT only has cash-flow-by-activity, the answer is `insufficient evidence`, not the cash-flow ranking. Intent preservation (13a) only applies when CONTEXT directly addresses the queried subject.
+14. For extract/boolean/list queries, output @@ANSWER: insufficient evidence only when direct evidence is absent or conflicting AND the underlying intent (per 13a) is also ungrounded.
 15. For exact numeric requests, return one exact value (no range/approx unless requested).
 16. Output one final answer only (no meta, no alternatives).
 
@@ -41,21 +43,57 @@ CONTEXT:
 REFLECTION_PROMPT = """
 Audit the draft answer for accuracy and grounding against QUERY_STATE + EVIDENCE_LEDGER + CONTEXT.
 Constraint codes: <<FINANCE_CONSTRAINT_CODES>>.
-Rules:
-1. Default PASS; use FAIL only for clear evidence-backed errors.
-2. Treat EVIDENCE_LEDGER as the primary accepted operand set for compute checks.
-3. For compute, verify arithmetic directly from values used in answer; if arithmetic is wrong, FAIL.
-4. For compute, if answer uses values outside EVIDENCE_LEDGER, FAIL.
-4a. Operand-slot provenance: for compute, each numeric operand in the answer must come from the EVIDENCE_LEDGER entry whose `slot` tag matches both the operand's claimed metric and period. If the answer used an entry tagged with a different metric or a different period than the slot it is filling, FAIL with `operand_slot_mismatch` and identify which ledger entry should have been used instead. When multiple ledger entries report values for the same metric across different periods, never use one period's value to fill another period's slot.
-4b. Operand-magnitude sanity: if QUERY_STATE.metric is a totals/aggregate concept (e.g., total revenue, total assets) and the chosen operand value is conspicuously smaller (≤25%) than another same-metric same-period candidate present in EVIDENCE_LEDGER or CONTEXT primary statement, FAIL with `operand_magnitude_anomaly`. Prefer the larger primary-statement total over a sub-line-item value.
-5. Fail on wrong/unsupported claims, invalid/missing citations, hallucinations, or query-constraint mismatch.
-6. Hard FAIL if any cited evidence conflicts with QUERY_STATE entity/period.
-7. Hard FAIL if answer says insufficient evidence while required slot coverage is complete in EVIDENCE_LEDGER.
-8. Hard FAIL if answer uses cross-company/year citation despite same-company/period evidence being present.
-9. Fail if required output format is ignored.
-10. For exact numeric questions, fail range/approx outputs unless explicitly requested.
-11. Fail if ANSWER contains multiple competing final answers (for example multiple @@ANSWER prefixes).
-12. Output JSON only (no prose outside JSON).
+
+Process: BEFORE assigning a verdict, internally run the four checks below
+and record what each produced under `checks_performed` (free-text findings,
+one entry per check). Default to PASS only when every check produced no
+counter-evidence; if any check surfaces a concrete defect cited from
+QUERY_STATE / EVIDENCE_LEDGER / CONTEXT, the verdict is FAIL.
+
+Checks:
+(A) Arithmetic & operand identity
+    - For compute, recompute from EVIDENCE_LEDGER values; arithmetic must match.
+    - Operand-slot provenance: each numeric operand must come from the
+      EVIDENCE_LEDGER entry whose `slot` tag matches both the operand's
+      metric and period. Wrong-slot reuse (e.g., using one period's value
+      for another period's slot) → `operand_slot_mismatch`.
+    - Operand-magnitude sanity: when the queried metric is a totals/aggregate
+      concept and the chosen operand is conspicuously smaller than another
+      same-metric same-period candidate present in EVIDENCE_LEDGER / CONTEXT
+      primary statement, prefer the primary total → `operand_magnitude_anomaly`.
+    - Formula-identity: when QUERY names a specific ratio/margin/coverage
+      (anything ending in "ratio", "margin", "yield", "turnover", "coverage"),
+      the operand set actually used in ANSWER must be consistent with the
+      standard definition of that named metric. If the operand set matches
+      a different (similarly-named) metric's definition instead, FAIL with
+      `formula_identity_mismatch`.
+(B) Enumeration coverage vs CONTEXT/EVIDENCE_LEDGER
+    - For extract/list/"what drove X" style queries: if EVIDENCE_LEDGER or
+      CONTEXT contains multiple grounded items the answer should report
+      (in the same sentence/list/table), the answer must include all such
+      grounded items. Omitting any → `incomplete_enumeration`. Do NOT fail
+      when the missing items are absent from EVIDENCE_LEDGER/CONTEXT.
+    - Restatement check: for "what drove"/"what caused" queries, an answer
+      that merely restates the metric or its delta without citing any
+      cause/driver clause present in CONTEXT → `restated_metric_no_drivers`.
+(C) Intent alignment
+    - Does the ANSWER address the QUERY's underlying intent, or does it
+      substitute an adjacent concept (e.g., reporting cash-flow-by-activity
+      when QUERY asks segment-by-revenue)? Concept substitution → FAIL.
+    - "Insufficient evidence" with the underlying intent grounded in
+      CONTEXT (drivers, qualitative direction) is also a FAIL — the answer
+      should report the intent-level finding rather than abstain.
+(D) Citation, entity/period, format
+    - Hard FAIL on cross-company / cross-period citations when same-company
+      / same-period evidence is present.
+    - Hard FAIL on missing/invalid inline citations, multiple competing
+      @@ANSWER prefixes, or required output-format violations.
+    - For exact numeric questions, range/approximate outputs FAIL unless
+      explicitly requested.
+    - "Insufficient evidence" with required slot coverage complete in
+      EVIDENCE_LEDGER → FAIL.
+
+Output JSON only (no prose outside JSON).
 
 QUERY: {query}
 QUERY_STATE: {query_state}
@@ -67,6 +105,7 @@ ANSWER: {draft_answer}
 REFLECTION_FORMAT_INSTRUCTION = """
 Output ONLY JSON:
 {
+  "checks_performed": ["A: ...", "B: ...", "C: ...", "D: ..."],
   "decision": "PASS|FAIL",
   "issues": [],
   "arithmetic_check": "ok|fail|na"
@@ -77,7 +116,7 @@ REFLECTION_RETRY_PROMPT = """
 Previous reflection output was invalid.
 Error: {error}
 Output ONLY one JSON object with exactly this schema:
-{{"decision":"PASS|FAIL","issues":[],"arithmetic_check":"ok|fail|na"}}
+{{"checks_performed":["A: ...","B: ...","C: ...","D: ..."],"decision":"PASS|FAIL","issues":[],"arithmetic_check":"ok|fail|na"}}
 PREVIOUS_OUTPUT: {previous_output}
 """
 

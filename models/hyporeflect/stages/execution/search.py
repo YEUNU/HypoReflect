@@ -138,9 +138,9 @@ class SearchSupport:
             cap = 12
         return deduped[:cap]
 
-    async def _call_graph_search(self, entities: list[str], depth: int, top_k: int) -> tuple[str, list[dict[str, Any]]]:
+    async def _call_graph_search(self, entities: list[str], depth: int, top_k: int, user_query: str = "", excluded_chunk_ids: Optional[set[str]] = None) -> tuple[str, list[dict[str, Any]]]:
         try:
-            result = self.grag.graph_search(entities, depth=depth, top_k=top_k)
+            result = self.grag.graph_search(entities, depth=depth, top_k=top_k, user_query=user_query, excluded_chunk_ids=excluded_chunk_ids)
             if asyncio.iscoroutine(result):
                 result = await result
             if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], list):
@@ -252,12 +252,17 @@ class SearchSupport:
 
     async def _handle_retrieval_tool_call(self, *, state: AgentState, turn: int, tool_call_id: str, routed_tool: str, routed_args: dict[str, Any], loop_state: Any, top_k: int, started: float) -> None:
         plan = self._build_tool_search_plan(state=state, routed_tool=routed_tool, routed_args=routed_args, loop_state=loop_state, top_k=top_k)
-        txt, data, filter_diag = await self._entity_guarded_graph_search(entities=plan.search_entities, depth=plan.depth, top_k=plan.top_k, query_state=state.query_state, user_query=state.user_query)
+        txt, data, filter_diag = await self._entity_guarded_graph_search(entities=plan.search_entities, depth=plan.depth, top_k=plan.top_k, query_state=state.query_state, user_query=state.user_query, excluded_chunk_ids=set(state.visited_chunk_ids))
         data_raw_count = int(filter_diag.get('initial_raw', 0) or 0)
         data_raw_count += int(filter_diag.get('retry_raw', 0) or 0)
         loop_state.tool_calls_used += 1
         if txt:
             state.history.append({'role': 'tool', 'tool_call_id': tool_call_id, 'name': routed_tool, 'content': txt})
+        # Mark chunks as visited so subsequent turns explore fresh ground.
+        for node in data:
+            node_id = str(node.get("id", "")).strip()
+            if node_id:
+                state.visited_chunk_ids.add(node_id)
         state.all_context_data.extend(data)
         ledger_context = self._build_context_excerpt(data, query_state=state.query_state)
         ledger_result = await self._extract_evidence_entries(state.query_state, ledger_context, filter_policy=state.filter_policy)
@@ -335,12 +340,18 @@ class SearchSupport:
         if not bootstrap_entities:
             return
         bootstrap_top_k = self._bootstrap_top_k(state)
-        bootstrap_txt, bootstrap_data, bootstrap_filter_diag = await self._entity_guarded_graph_search(entities=bootstrap_entities, depth=1, top_k=bootstrap_top_k, query_state=state.query_state, user_query=state.user_query)
+        # Bootstrap is the first retrieval — visited_chunk_ids should be
+        # empty here, but pass it for symmetry / future-proofing.
+        bootstrap_txt, bootstrap_data, bootstrap_filter_diag = await self._entity_guarded_graph_search(entities=bootstrap_entities, depth=1, top_k=bootstrap_top_k, query_state=state.query_state, user_query=state.user_query, excluded_chunk_ids=set(state.visited_chunk_ids))
         bootstrap_data_raw = int(bootstrap_filter_diag.get('initial_raw', 0) or 0)
         bootstrap_data_raw += int(bootstrap_filter_diag.get('retry_raw', 0) or 0)
         loop_state.tool_calls_used += 1
         if bootstrap_txt:
             state.history.append({'role': 'tool', 'tool_call_id': 'bootstrap_0', 'name': 'graph_search_bootstrap', 'content': bootstrap_txt})
+        for node in bootstrap_data:
+            node_id = str(node.get("id", "")).strip()
+            if node_id:
+                state.visited_chunk_ids.add(node_id)
         state.all_context_data.extend(bootstrap_data)
         bootstrap_ledger_context = self._build_context_excerpt(bootstrap_data, query_state=state.query_state)
         bootstrap_result = await self._extract_evidence_entries(state.query_state, bootstrap_ledger_context, filter_policy=state.filter_policy)

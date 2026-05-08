@@ -88,7 +88,12 @@ Rules:
 6. For compute queries: when required slots are grounded, call `calculator` with one explicit expression; use precision from QUERY_STATE.rounding when available.
 7. Treat C1-violating evidence as non-evidence and continue retrieval.
 8. Stop when all required slots are grounded and computation is resolved.
-9. TOOL_HISTORY shows prior tool calls and their outcomes (new_entries, reject_reasons). Do NOT repeat a graph_search with the same `entities` set (in any order) when the prior call yielded 0 new ledger entries — vary entities (add metric synonyms, alternate line-item names, change source_anchor) or change top_k. If all prior attempts failed similarly, switch to a different missing slot before retrying.
+9. TOOL_HISTORY shows prior tool calls and outcomes (new_entries, reject_reasons). MANDATORY rules:
+   (a) The next graph_search MUST contain at least one `entities` token that did NOT appear in any prior call's `entities` set. Repeating the same token bag with `top_k`-only changes is forbidden.
+   (b) When prior calls returned 0 new ledger entries, prefer adding alternate line-item names that the SAME line-item could appear under (e.g., the formula-name, the GAAP caption, the table-row label, the note-table label). Cycle through: query-literal name → standard accounting caption → note-table label.
+   (c) When prior calls hit `value_period_mismatch` or `citation_period_mismatch`, restate the period in a different form on the next attempt (FY token, calendar-year token, "year ended <date>"); do NOT just repeat the period string.
+   (d) When prior calls hit `source_anchor_mismatch`, switch the anchor (e.g., income statement ↔ cash flow statement ↔ balance sheet) on the next attempt.
+   (e) If three consecutive calls failed similarly, abandon this slot and call calculator on partially-grounded operands or move to the next missing slot.
 QUERY_STATE:
 {query_state}
 MISSING_SLOTS:

@@ -15,7 +15,7 @@ from core.config import RAGConfig
 
 
 class RetrieveMixin:
-    async def retrieve(self, query: str, top_k: int = 5) -> tuple:
+    async def retrieve(self, query: str, top_k: int = 5, user_query: str = "") -> tuple:
         rewrites: list[str] = []
         if RAGConfig.ENABLE_QUERY_REWRITE:
             rewrites = await self._rewrite_query(query)
@@ -61,7 +61,12 @@ class RetrieveMixin:
             reverse=True,
         )[: max(20, top_k * 6)]
 
-        query_meta = self._extract_query_metadata(query)
+        # Company-anchor metadata must come from the human-written query.
+        # When `query` is a synthetic graph_search seed (joined LLM entities),
+        # extracting metadata from it produces compound "company keys" that
+        # silently empty the strict company filter pool.
+        meta_source = user_query.strip() if user_query and user_query.strip() else query
+        query_meta = self._extract_query_metadata(meta_source)
         stage1_nodes, stage1_reranked = await self._rerank_and_select(query, stage1_candidates, top_k, query_meta)
 
         if not stage1_nodes and not stage1_reranked:

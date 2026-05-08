@@ -26,7 +26,6 @@ class RAGConfig:
         "EVAL_MODEL",
         os.environ.get("VLLM_SERVED_MODEL_NAME", "generation-model")
     )  # Default to local served model unless explicitly overridden.
-    HALLUCINATION_EVAL_MODEL = os.environ.get("HALLUCINATION_EVAL_MODEL", "gpt-5.5-2026-04-23")
 
     # --- Per-stage model overrides (empty string = use DEFAULT_MODEL) ---
     # Supports local vLLM model names or OpenAI model names (gpt-*, o1-*, o3-*, o4-*)

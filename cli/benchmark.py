@@ -234,7 +234,7 @@ async def run_benchmark(
                     "hallucination": 0.0,
                     "hallucination_reason": "runtime_error",
                     "hallucination_source": "runtime_error",
-                    "hallucination_model": str(RAGConfig.HALLUCINATION_EVAL_MODEL or ""),
+                    "hallucination_model": str(RAGConfig.EVAL_MODEL or ""),
                     "doc_match": 0.0,
                     "page_match": 0.0,
                 }

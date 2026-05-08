@@ -42,7 +42,6 @@ export NEO4J_CONTAINER_NAME=hyporeflect-neo4j
 
 export OPENAI_API_KEY=...
 export EVAL_MODEL=gpt-5.2
-export HALLUCINATION_EVAL_MODEL=gpt-5.2
 ```
 
 `OPENAI_API_KEY` is only needed if you want judge/evaluation calls to use OpenAI instead of the local served model.

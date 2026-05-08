@@ -29,3 +29,9 @@ class AgentState:
     ledger_attempts: list[dict[str, Any]] = field(default_factory=list)
     reflection_meta: dict[str, Any] = field(default_factory=dict)
     trace: list[TraceEvent] = field(default_factory=list)
+    # IDs of chunks already returned by any previous graph_search/retrieve
+    # call within this query. Threaded through to subsequent calls so
+    # bootstrap/turn-N retrievals do not re-surface the same chunk through
+    # different seed paths (NEXT/HOP traversal can reach the same hub chunk
+    # from many seeds, producing 30-50% duplication observed empirically).
+    visited_chunk_ids: set[str] = field(default_factory=set)

@@ -11,7 +11,7 @@ Two HOP modes:
   expand the frontier at query time via Q+ ANN + cross-encoder rerank.
 """
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from core.config import RAGConfig
 from utils.prompts import SEARCH_CONTINUATION_FORMAT_INSTRUCTION
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class TraversalMixin:
-    async def graph_search(self, entities: list[str], depth: int = 2, top_k: int = 5) -> tuple:
+    async def graph_search(self, entities: list[str], depth: int = 2, top_k: int = 5, user_query: str = "", excluded_chunk_ids: Optional[set[str]] = None) -> tuple:
         normalized_entities: list[str] = []
         for entity in entities:
             normalized = self._normalize_entity_term(entity)
@@ -36,8 +36,15 @@ class TraversalMixin:
         except Exception:
             depth = 4
 
+        excluded_ids: set[str] = {str(eid).strip() for eid in (excluded_chunk_ids or set()) if str(eid).strip()}
+
         seed_top_k = max(1, min(max(1, top_k - 1), RAGConfig.GRAPH_SEARCH_LIMIT))
-        _, seed_nodes = await self.retrieve(seed_query, top_k=seed_top_k)
+        _, seed_nodes = await self.retrieve(seed_query, top_k=seed_top_k, user_query=user_query)
+        # Filter out chunks already retrieved on prior turns of this query so
+        # NEXT/HOP graph traversal explores fresh territory rather than
+        # re-surfacing the same hub chunks via different seed paths.
+        if excluded_ids:
+            seed_nodes = [n for n in seed_nodes if str(n.get("id", "")).strip() not in excluded_ids]
         seed_ids = [
             str(node.get("id")).strip()
             for node in seed_nodes
@@ -45,12 +52,28 @@ class TraversalMixin:
         ]
 
         if not seed_ids:
-            return await self.retrieve(seed_query, top_k=top_k)
+            fallback_ctx, fallback_nodes = await self.retrieve(seed_query, top_k=top_k, user_query=user_query)
+            if excluded_ids:
+                fallback_nodes = [n for n in fallback_nodes if str(n.get("id", "")).strip() not in excluded_ids]
+                fallback_ctx = self._build_context_from_nodes(fallback_nodes) if fallback_nodes else fallback_ctx
+            return fallback_ctx, fallback_nodes
         search_query = " ".join(entities).strip() or " ".join(normalized_entities)
-        search_query_meta = self._extract_query_metadata(search_query)
+        # Company-key extraction must come from the human-written query when
+        # available — joining LLM-generated `entities` produces synthetic
+        # phrases like "amd fy21 income statement of operations consolidated
+        # statements of operations" whose normalized form falsely registers
+        # as a company key and empties the strict company filter pool. The
+        # rerank/finalize stage still uses the synthetic search_query for
+        # reranker scoring (where the broader phrasing is useful); only the
+        # company-anchor metadata is sourced from user_query.
+        meta_query = user_query.strip() if user_query and user_query.strip() else search_query
+        search_query_meta = self._extract_query_metadata(meta_query)
         step_limit = max(RAGConfig.GRAPH_SEARCH_LIMIT, top_k * 6)
         frontier_ids = [seed_id for seed_id in seed_ids if seed_id]
-        visited_ids = set(frontier_ids)
+        # Track within-call traversal history AND prior-turn exclusions so
+        # neither this call's expansion nor the final result returns chunks
+        # already surfaced by previous calls.
+        visited_ids = set(frontier_ids) | excluded_ids
         collected: dict[str, dict[str, Any]] = {}
 
         async def _rerank_and_gate(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -81,10 +104,21 @@ class TraversalMixin:
                 if company_matched:
                     reranked = company_matched
 
-            gated = [node for node in reranked if node.get("rerank_score", 0.0) >= RAGConfig.RERANKER_THRESHOLD]
-            if gated:
-                return gated
-            return reranked[: max(top_k, 3)]
+            gated = [node for node in reranked if node.get("rerank_score", 0.0) >= RAGConfig.RERANKER_THRESHOLD][:top_k]
+            # Top up to top_k with next-best ungated candidates so a
+            # too-aggressive reranker gate (single chunk crossing tau_r)
+            # does not collapse the candidate pool.
+            target_k = max(top_k, 3)
+            if len(gated) < target_k and len(gated) < len(reranked):
+                seen = {id(node) for node in gated}
+                for node in reranked:
+                    if id(node) in seen:
+                        continue
+                    gated.append(node)
+                    seen.add(id(node))
+                    if len(gated) >= target_k:
+                        break
+            return gated
 
         async def _need_more_for_next_depth(nodes_for_judge: list[dict[str, Any]]) -> bool:
             if not nodes_for_judge:
@@ -158,18 +192,26 @@ class TraversalMixin:
                 })
                 candidates = [dict(record) async for record in result]
 
-            if RAGConfig.HOP_MODE == "runtime":
-                runtime_cands = await self._runtime_hop_candidates(
-                    frontier_ids=frontier_ids,
-                    visited_ids=visited_ids,
-                    step_limit=step_limit,
-                )
-                seen_ids = {str(node.get("id", "")) for node in candidates}
-                for cand in runtime_cands:
-                    cand_id = str(cand.get("id", ""))
-                    if cand_id and cand_id not in seen_ids:
-                        candidates.append(cand)
-                        seen_ids.add(cand_id)
+            # Always augment with runtime HOP (frontier Q+ → Q+ ANN) as a
+            # complement, even in offline HOP_MODE. Pre-built HOP edges are
+            # constructed at indexing time with a tau_r=0.5 cutoff and the
+            # paper's HOP_LINK_LIMIT cap, so high-value answer chunks may
+            # have zero pre-built HOP edges (e.g., specialised cash-flow
+            # reconciliation rows whose Q+ does not pair with any other Q+
+            # above tau_r). Runtime HOP expands the frontier by Q+ vector
+            # similarity at query time, which recovers those isolated
+            # answer chunks. Latency cost is bounded by step_limit.
+            runtime_cands = await self._runtime_hop_candidates(
+                frontier_ids=frontier_ids,
+                visited_ids=visited_ids,
+                step_limit=step_limit,
+            )
+            seen_ids = {str(node.get("id", "")) for node in candidates}
+            for cand in runtime_cands:
+                cand_id = str(cand.get("id", ""))
+                if cand_id and cand_id not in seen_ids:
+                    candidates.append(cand)
+                    seen_ids.add(cand_id)
 
             if not candidates:
                 break
