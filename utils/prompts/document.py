@@ -1,9 +1,3 @@
-OCR_PROMPT = """
-Transcribe this page using Markdown. Rules:
-1. Use Markdown for all text and tables.
-2. Describe images, charts, and diagrams in detail as plain text.
-"""
-
 PAGE_SUMMARY_PROMPT = """
 Summarize this page.
 Rules:
@@ -30,24 +24,6 @@ PAGE SUMMARIES:
 {page_summaries}
 """
 
-
-ROLLING_SUMMARY_PROMPT = """
-You are an expert technical document synthesizer.
-Below is a 'Current Summary' of the preceding parts of a document, followed by 'New Content' from the next section.
-Create a new, integrated, and dense technical summary that merges both.
-Rules:
-1. Keep entity/period/metric terms explicit.
-2. If numbers are included, preserve exact value strings (unit/sign/decimal/currency/percent).
-3. Do not convert units or round figures.
-
-### Current Summary:
-{running_summary}
-
-### New Content:
-{new_content}
-
-New Integrated Summary:
-"""
 
 GLOBAL_SUMMARY_PROMPT = """
 Analyze the provided page summaries to generate document-level metadata.

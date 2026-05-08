@@ -1,12 +1,3 @@
-BENCHMARK_MATH_FORMAT_INSTRUCTION = (
-    "Please reason step by step, and put your final answer within \\boxed{}."
-)
-
-BENCHMARK_MCQ_JSON_FORMAT_INSTRUCTION = (
-    'Please show your choice in the answer field with only the choice letter, '
-    'e.g., "answer": "C".'
-)
-
 QUERY_CATEGORIZATION_PROMPT = """
 Analyze the provided query and its ground truth evidence to categorize it for an ablation study.
 Categories:

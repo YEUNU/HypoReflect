@@ -1,7 +1,5 @@
 import json
-import re
-import os
-from typing import Any, Optional, Dict
+from typing import Any, Optional
 
 def clean_and_parse_json(text: str) -> Optional[Any]:
     """
@@ -49,59 +47,3 @@ def clean_and_unwrap_json(text: str) -> str:
             
     return current_text
 
-def resolve_metadata_with_fallback(g_data: Dict[str, Any], filename: str) -> Dict[str, Any]:
-    """
-    Resolves metadata with fallback strategy.
-    """
-    if not g_data or not isinstance(g_data, dict):
-        g_data = {}
-
-    title = g_data.get("title") or os.path.splitext(filename)[0]
-    category = g_data.get("category") or "기타"
-    summary = g_data.get("summary") or "Summary unavailable"
-    keywords = g_data.get("keywords") or []
-
-    meta = g_data.get("metadata", {})
-    project_name = meta.get("project_name")
-    year_raw = meta.get("year")
-    author = meta.get("author")
-    status_raw = meta.get("status")
-
-    year = None
-    if year_raw:
-        try:
-            year = int(str(year_raw))
-        except ValueError:
-            pass
-            
-    if not year:
-        ym = re.search(r'(20\d{2})', filename)
-        if ym: 
-            year = int(ym.group(1))
-
-    status = "Unknown"
-    if status_raw:
-        if status_raw.lower() in ["draft", "초안"]: status = "Draft"
-        elif status_raw.lower() in ["final", "확정", "최종"]: status = "Final"
-        elif status_raw in ["Draft", "Final", "Unknown"]: status = status_raw
-    
-    if status == "Unknown":
-        lower_name = filename.lower()
-        if any(x in lower_name for x in ['draft', '초안', 'v0.']):
-            status = "Draft"
-        elif any(x in lower_name for x in ['final', '확정', '최종']):
-            status = "Final"
-
-    if project_name in ["N/A", "Unknown", None]: project_name = None
-    if author in ["N/A", "Unknown", None]: author = None
-
-    return {
-        "title": title,
-        "category": category,
-        "summary": summary,
-        "keywords": keywords,
-        "project_name": project_name,
-        "year": year,
-        "author": author,
-        "status": status
-    }

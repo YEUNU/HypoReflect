@@ -37,7 +37,7 @@ class HopEdgeMixin:
         # cross-document (paper §3.1.4 multi-hop discovery).
         src_company = hop_src.get("company") or ""
 
-        query = f"""
+        query = """
             CALL db.index.vector.queryNodes($index, 15, $embed)
             YIELD node, score
             WHERE node.id <> $src_id
@@ -57,7 +57,7 @@ class HopEdgeMixin:
         if results:
             return results
 
-        fallback_query = f"""
+        fallback_query = """
             CALL db.index.vector.queryNodes($index, 15, $embed)
             YIELD node, score
             WHERE node.id <> $src_id

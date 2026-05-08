@@ -1,7 +1,6 @@
 """Planning artifacts maintained inside the Execution loop:
 QueryState init/sanitize/review (paper §3.2.2 → execution-time refresh),
 required_slots tracking, and entity matching."""
-from typing import Any
 from typing import Any, Optional
 import logging
 import re

@@ -38,26 +38,6 @@ CONTEXT:
     _COMPUTE_MISSING_POLICY_LINE,
 )
 
-COMPLEX_AGENT_PROMPT_TEMPLATE_GENERIC = """
-Answer the query using ONLY the provided context and evidence ledger.
-Rules:
-1. Start with @@ANSWER: and support key claims with [[Title, Page X, Chunk Y]] citations from CONTEXT only.
-2. Enforce QUERY_STATE constraints (entities, dates, relation, output format).
-3. For extract/boolean/list questions, answer only from grounded evidence; no guessing.
-4. For bridge/comparison questions, combine multiple grounded citations when needed, but keep the final answer concise.
-5. If CALCULATOR_RESULT is provided, any final numeric answer must match it exactly.
-6. Output @@ANSWER: insufficient evidence only when direct or bridge evidence is absent or conflicting.
-7. Output one final answer only (no meta, no alternatives).
-
-QUERY_STATE:
-{query_state}
-EVIDENCE_LEDGER:
-{evidence_ledger}
-
-CONTEXT:
-{context}
-"""
-
 REFLECTION_PROMPT = """
 Audit the draft answer for accuracy and grounding against QUERY_STATE + EVIDENCE_LEDGER + CONTEXT.
 Constraint codes: <<FINANCE_CONSTRAINT_CODES>>.
@@ -83,24 +63,6 @@ EVIDENCE_LEDGER: {evidence_ledger}
 CONTEXT: {context}
 ANSWER: {draft_answer}
 """.replace("<<FINANCE_CONSTRAINT_CODES>>", _FINANCE_CONSTRAINT_CODES)
-
-REFLECTION_PROMPT_GENERIC = """
-Audit the draft answer for accuracy and grounding against QUERY_STATE + EVIDENCE_LEDGER + CONTEXT.
-Rules:
-1. Use FAIL for unsupported claims, invalid/missing citations, query-entity mismatch, or answer-format violations.
-2. Fail if ANSWER ignores an explicit named entity, date, comparison target, or bridge relation required by QUERY_STATE.
-3. Fail if ANSWER says insufficient evidence while CONTEXT contains directly useful bridge/comparison evidence.
-4. Fail if CONTEXT is clearly off-topic relative to the named entities in QUERY and ANSWER still concludes insufficient evidence without using targeted evidence.
-5. For numeric questions, fail range/approx outputs unless explicitly requested.
-6. Fail if ANSWER contains multiple competing final answers.
-7. Output JSON only (no prose outside JSON).
-
-QUERY: {query}
-QUERY_STATE: {query_state}
-EVIDENCE_LEDGER: {evidence_ledger}
-CONTEXT: {context}
-ANSWER: {draft_answer}
-"""
 
 REFLECTION_FORMAT_INSTRUCTION = """
 Output ONLY JSON:

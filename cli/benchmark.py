@@ -13,15 +13,10 @@ from models.hyporeflect.service import AgentService
 from models.naive.naive_rag import NaiveRAG
 from utils.io import _safe_float
 from utils.metrics import evaluate_financebench_response
-from utils.prompts import BENCHMARK_MATH_FORMAT_INSTRUCTION, BENCHMARK_MCQ_JSON_FORMAT_INSTRUCTION
 from utils.reporting import _write_model_report_artifacts
 
 
 logger = logging.getLogger("HypoReflect")
-
-
-def _as_lower_text(value: Any) -> str:
-    return str(value or "").strip().lower()
 
 
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]+(?:\{[^{}]*\}[^{}]*)*)\}")
@@ -47,61 +42,14 @@ def _extract_final_answer(answer_text: str) -> str:
     return answer_text[-300:].strip()
 
 
-def _is_multiple_choice_query(item: dict[str, Any]) -> bool:
-    for key in ("choices", "options", "answer_choices"):
-        value = item.get(key)
-        if isinstance(value, dict) and len(value) >= 2:
-            return True
-        if isinstance(value, list) and len(value) >= 2:
-            return True
-
-    format_blob = " ".join(
-        _as_lower_text(item.get(key))
-        for key in ("answer_type", "question_type", "question_format", "task_type")
-    )
-    if any(tag in format_blob for tag in ("mcq", "multiple choice", "multiple-choice")):
-        return True
-
-    query = str(item.get("query", "") or "")
-    alpha_choices = re.findall(r"(?m)^\s*([A-Ha-h])[\).]\s+", query)
-    paren_choices = re.findall(r"(?m)[\(\[]([A-Ha-h])[\)\]]\s+", query)
-    return len(set(letter.upper() for letter in alpha_choices + paren_choices)) >= 2
-
-
-def _is_math_query(item: dict[str, Any]) -> bool:
-    answer_type = _as_lower_text(item.get("answer_type"))
-    if answer_type in {"compute", "math", "numerical", "calculation"}:
-        return True
-
-    reasoning_blob = " ".join(
-        _as_lower_text(item.get(key))
-        for key in ("question_reasoning", "question_type", "reasoning_type", "task_type")
-    )
-    if any(
-        token in reasoning_blob
-        for token in ("numerical reasoning", "math", "mathematical", "calculation", "compute", "arithmetic")
-    ):
-        return True
-
-    query = _as_lower_text(item.get("query"))
-    legacy_math_pattern = r"\b(calculate|compute|ratio|percentage|percent change|difference|average)\b"
-    return bool(re.search(legacy_math_pattern, query)) and bool(re.search(r"\d", query))
-
-
 def _build_benchmark_query(query: str, item: dict[str, Any]) -> str:
     """Return the user-facing query as-is.
 
     The previous implementation appended `[Benchmark Output Format]` blocks
-    instructing the model to produce step-by-step CoT inside `\\boxed{}`. That
-    suffix (a) leaked into retrieval embeddings as noise, (b) forced verbose
-    reasoning that doubled latency, and (c) collided with the citation-first
-    answer format expected by `simple_answer_prompt`. The judge prompt now
-    handles `\\boxed{}` / "Final Answer:" extraction internally, so emitting
-    that scaffolding upstream provides no signal — only confounds.
-
-    Math/MCQ format instructions are kept available as constants but are not
-    injected into the live benchmark query. Re-enable behind a config flag
-    if a future evaluation legitimately needs them.
+    that forced verbose CoT inside `\\boxed{}`. That suffix leaked into
+    retrieval embeddings as noise and collided with the citation-first
+    answer format. The judge prompt extracts `\\boxed{}` / `Final Answer:`
+    internally, so the scaffolding adds no signal upstream.
     """
     _ = item  # kept for signature stability; type detection no longer alters the query.
     return query

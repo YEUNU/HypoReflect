@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import re
 import copy
 import json
 import inspect
@@ -517,7 +516,7 @@ class VLLMClient:
         for attempt in range(RAGConfig.LLM_MAX_RETRIES):
             try:
                 return await coro_func(*args, **kwargs)
-            except (httpx.TimeoutException, openai.APITimeoutError) as e:
+            except (httpx.TimeoutException, openai.APITimeoutError):
                 if attempt == RAGConfig.LLM_MAX_RETRIES - 1:
                     raise
                 delay = RAGConfig.LLM_RETRY_DELAY * (2 ** attempt)

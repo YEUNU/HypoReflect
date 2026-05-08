@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from cli.benchmark import run_benchmark, run_benchmark_multi_seed
+from cli.benchmark import run_benchmark_multi_seed
 from cli.index import run_indexing
 from models.hyporeflect.indexing.ocr import run_ocr
 from core.neo4j_service import Neo4jService

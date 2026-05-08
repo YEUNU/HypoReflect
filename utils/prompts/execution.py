@@ -26,23 +26,6 @@ Rules:
 QUERY: {query}
 """
 
-QUERY_STATE_PROMPT_GENERIC = """
-Extract compact QUERY_STATE JSON for open-domain multi-hop QA.
-Fields: entity, period, metric, source_anchor(null unless explicit), answer_type(extract|compute|boolean|list), required_slots, unit, rounding, missing_data_policy(insufficient|zero_if_not_explicit|inapplicable_explain).
-Rules:
-1. required_slots must be a JSON array of atomic slot objects for ALL answer types.
-2. Top-level entity may be empty string or a primary anchor entity; do not collapse multiple entities into one slot.
-3. For comparison questions, include one slot per comparison target entity.
-4. For bridge questions, include slots for explicit entities/work titles needed to identify the intermediate entity and the final answer-bearing fact.
-5. metric may be a short relation/attribute label such as nationality, spouse, government position, birthplace, or portrayed role.
-6. If period/date is not explicit in QUERY, keep period as empty string instead of inventing one.
-7. Set source_anchor to null unless the query explicitly requests a source type.
-8. required_slots for extract/boolean/list must remain non-empty and citation-checkable.
-9. Do not output dict-strings, serialized JSON strings, or prose in slot fields.
-10. missing_data_policy should be "insufficient" unless the query explicitly requests another supported policy.
-QUERY: {query}
-"""
-
 QUERY_STATE_FORMAT_INSTRUCTION = """
 Output ONLY JSON:
 {{"entity":"...","period":"...","metric":"...","source_anchor":null,"answer_type":"extract|compute|boolean|list","required_slots":[{{"entity":"...","period":"...","metric":"...","source_anchor":"..."}}],"unit":null,"rounding":null,"missing_data_policy":"insufficient|zero_if_not_explicit|inapplicable_explain"}}
@@ -73,21 +56,6 @@ Rules:
 7. For extract/boolean/list, required_slots must not be empty.
 8. Reject vague slots, embedded JSON/dict strings, or combined-period slot expressions.
 9. Keep missing_data_policy query-grounded and valid (insufficient|zero_if_not_explicit|inapplicable_explain).
-QUERY: {query}
-DRAFT_QUERY_STATE: {draft_query_state}
-"""
-
-QUERY_STATE_REVIEW_PROMPT_GENERIC = """
-Review and correct QUERY_STATE for the given query.
-Rules:
-1. Keep only query-grounded values.
-2. Top-level entity may be empty string or a primary anchor entity; never use generic placeholders.
-3. Do not collapse multiple comparison or bridge entities into a single slot.
-4. Keep source_anchor null unless the query explicitly requests a source type.
-5. required_slots must be atomic slot objects, concrete, and citation-checkable.
-6. For comparison questions, keep one slot per comparison target entity.
-7. For bridge questions, keep slots that preserve the intermediate entity/article needed to reach the answer.
-8. Keep missing_data_policy query-grounded and valid.
 QUERY: {query}
 DRAFT_QUERY_STATE: {draft_query_state}
 """
@@ -227,44 +195,6 @@ Previous ENTRY_GATE output was invalid.
 Error: {error}
 Output ONLY one JSON object with exactly this schema:
 {{"decisions":[{{"index":0,"keep":true,"reason":"..."}}]}}
-PREVIOUS_OUTPUT: {previous_output}
-"""
-
-SLOT_CANDIDATE_VERIFIER_PROMPT = """
-Select the best candidate per slot from provided SLOT_CANDIDATES.
-Rules:
-1. You must choose only from candidate_id values provided for each slot; never invent new values or citations.
-2. Respect QUERY_STATE constraints first: entity, period, metric, source_anchor, and compute operand intent.
-3. Prefer candidates with direct metric/period alignment and cleaner citation grounding.
-4. If no candidate is clearly reliable for a slot, return verdict=unresolved for that slot.
-5. Keep output concise and deterministic; do not include prose outside JSON.
-QUERY: {query}
-QUERY_STATE: {query_state}
-SLOT_CANDIDATES: {slot_candidates}
-CONTEXT: {context}
-"""
-
-SLOT_CANDIDATE_VERIFIER_FORMAT_INSTRUCTION = """
-Output ONLY JSON:
-{
-  "decisions": [
-    {
-      "slot_key": "normalized slot key",
-      "selected_candidate_id": "c1|null",
-      "verdict": "selected|unresolved",
-      "confidence": 0.0,
-      "reason": "short reason"
-    }
-  ]
-}
-"""
-
-SLOT_CANDIDATE_VERIFIER_RETRY_PROMPT = """
-Previous SLOT_CANDIDATE_VERIFIER output was invalid.
-Error: {error}
-Output ONLY one JSON object with exactly this schema:
-{{"decisions":[{{"slot_key":"...","selected_candidate_id":"c1|null","verdict":"selected|unresolved","confidence":0.0,"reason":"..."}}]}}
-Do not invent candidate_id values.
 PREVIOUS_OUTPUT: {previous_output}
 """
 

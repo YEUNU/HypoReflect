@@ -1,7 +1,6 @@
 import os
 from neo4j import AsyncGraphDatabase
 from typing import List, Dict, Any, Optional
-import re
 import logging
 
 class Neo4jService:

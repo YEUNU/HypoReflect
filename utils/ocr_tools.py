@@ -12,7 +12,7 @@ import io
 import unicodedata
 import asyncio
 import logging
-from typing import Optional, Callable, List, Dict, Any, Tuple
+from typing import Optional, Callable, List, Dict, Tuple
 
 from PIL import Image
 from pdf2image import convert_from_bytes, pdfinfo_from_bytes
@@ -20,7 +20,6 @@ from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 from core.vllm_client import VLLMClient
 from core.config import RAGConfig
 from utils.prompts import TABLE_TO_TEXT_PROMPT
-import re
 
 logger = logging.getLogger(__name__)
 

@@ -50,17 +50,6 @@ Rules:
 Original Query: {query}
 """
 
-QUERY_REWRITE_PROMPT_GENERIC = """
-Rewrite the query into domain-neutral retrieval variants.
-Rules:
-1. Generate 1-3 high-precision variants preserving original meaning.
-2. Preserve named entities, dates, qualifiers, and comparison targets exactly when present.
-3. Do not introduce domain-specific jargon that is absent from the original query.
-4. Prefer lexical variants and disambiguating phrasing that improve recall without changing intent.
-5. Do NOT introduce unsupported assumptions, extra entities, or special query syntax operators.
-Original Query: {query}
-"""
-
 QUERY_REWRITE_FORMAT_INSTRUCTION = """
 Output ONLY JSON:
 {{"positive_queries": []}}
@@ -74,14 +63,6 @@ RERANKER_INSTRUCTION = (
     "Down-rank boilerplate."
 )
 
-RERANKER_INSTRUCTION_GENERIC = (
-    "Given a question, rank passages by direct answerability and evidential relevance. "
-    "Hard constraints: prioritize passages matching the same entities, dates, and relation described in the query; "
-    "strongly penalize entity or date mismatches. "
-    "Prefer passages that contain explicit facts useful for multi-hop reasoning or direct comparison. "
-    "Down-rank boilerplate, navigation text, and weakly related passages."
-)
-
 SEARCH_CONTINUATION_PROMPT = """
 Decide whether retrieval should continue.
 Decision rules:
@@ -90,18 +71,6 @@ Decision rules:
 3. For compute queries, evidence may come from multiple pages/documents; do not require a single-document hit.
 4. Return "INSUFFICIENT" if any required slot is missing, ambiguous, conflicting, or tied to the wrong entity/period.
 5. Prefer stopping as soon as slot coverage is complete; avoid unnecessary extra hops.
-QUERY: {query}
-CONTEXT: {context}
-"""
-
-SEARCH_CONTINUATION_PROMPT_GENERIC = """
-Decide whether retrieval should continue.
-Decision rules:
-1. Infer the minimum evidence needed to answer QUERY directly.
-2. Return "SUFFICIENT" only when the current context contains enough grounded evidence to answer the query.
-3. Return "INSUFFICIENT" if a required entity, relation, comparison target, or date is missing, ambiguous, or conflicting.
-4. Multi-hop questions may require evidence from multiple passages; do not require all evidence to come from one passage.
-5. Prefer stopping as soon as the evidence is sufficient; avoid unnecessary extra hops.
 QUERY: {query}
 CONTEXT: {context}
 """

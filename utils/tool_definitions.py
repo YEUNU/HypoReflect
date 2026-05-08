@@ -8,12 +8,6 @@ class GraphSearchArgs(BaseModel):
     top_k: int = Field(default=5, description="Maximum number of passages to return.")
 
 
-class RetrieveArgs(BaseModel):
-    """Arguments for hybrid retrieval fallback/search."""
-    query: str = Field(..., description="Natural language query for retrieval.")
-    top_k: int = Field(default=5, description="Maximum number of passages to return.")
-
-
 class CalculatorArgs(BaseModel):
     """Arguments for deterministic arithmetic calculation."""
     expression: str = Field(
@@ -33,17 +27,6 @@ def get_graph_search_tool_schema() -> Dict[str, Any]:
             "name": "graph_search",
             "description": "Use this when entity relationship expansion is needed (multi-hop over graph links).",
             "parameters": GraphSearchArgs.model_json_schema()
-        }
-    }
-
-
-def get_retrieve_tool_schema() -> Dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "retrieve",
-            "description": "Use this for general evidence gathering via hybrid vector+text retrieval.",
-            "parameters": RetrieveArgs.model_json_schema()
         }
     }
 

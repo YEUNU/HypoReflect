@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from utils.prompts import CALCULATION_PLAN_PROMPT, CALCULATION_PLAN_RETRY_PROMPT
 from models.hyporeflect.state import AgentState
-from models.hyporeflect.stages.common import answer_matches_calc_result, extract_first_number
+from models.hyporeflect.stages.common import answer_matches_calc_result
 from models.hyporeflect.stages.llm_json import compact_json, generate_json_with_retries
 
 

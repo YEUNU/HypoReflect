@@ -43,23 +43,6 @@ QUERY: {query}
 CONTEXT: {context}
 """
 
-PLANNING_PROMPT_GENERIC = """
-Create a concise, executable retrieval plan for the query.
-Rules:
-1. First identify query type: extract|boolean|list|compute.
-2. Extract key constraints: named entities, comparison targets, bridge clues, dates, and target relation/attribute.
-3. Decompose into required evidence hops; for bridge questions, retrieve the intermediate entity before the final attribute.
-4. For each step, specify what evidence to retrieve and how it will reduce uncertainty.
-5. Prefer article/title/entity matches first, then supporting relation passages.
-6. Stop as soon as the answer is directly grounded by citation-backed evidence.
-7. If evidence conflicts, mark the unresolved hop and add one focused retrieval step for it.
-8. Keep output to 3-5 numbered steps and include a final verification step.
-Output format for each step:
-- Step N: objective | target slots | evidence target | done condition
-QUERY: {query}
-CONTEXT: {context}
-"""
-
 PLANNING_FILTER_PROMPT = """
 Create evidence filtering policy JSON for the query and retrieval plan.
 Goal: define what evidence should be kept/dropped during ledger construction.
@@ -68,19 +51,6 @@ Rules:
 2. Use query constraints first: entity, period, metric, source_anchor.
 3. Specify strictness for entity/period/source_anchor matching.
 4. List preferred statement markers and disallowed patterns.
-5. Define conflict strategy for multiple candidates per slot.
-QUERY: {query}
-PLAN: {plan}
-"""
-
-PLANNING_FILTER_PROMPT_GENERIC = """
-Create evidence filtering policy JSON for the query and retrieval plan.
-Goal: define what evidence should be kept/dropped during ledger construction.
-Rules:
-1. Keep policy compact and operational.
-2. Use query constraints first: named entities, dates, comparison targets, bridge intermediates, and target relation.
-3. Specify strictness for entity/date matching; do not invent source anchors.
-4. Prefer passages that directly identify bridge entities or answer-bearing facts.
 5. Define conflict strategy for multiple candidates per slot.
 QUERY: {query}
 PLAN: {plan}
@@ -128,25 +98,3 @@ TOOL_HISTORY:
 CURRENT CONTEXT:
 {context}
 """.replace("<<FINANCE_CONSTRAINT_CODES>>", _FINANCE_CONSTRAINT_CODES)
-
-AGENT_EXECUTION_SYSTEM_PROMPT_GENERIC = """
-You are an open-domain evidence retriever.
-Goal: fill missing query slots and bridge entities with grounded evidence.
-Rules:
-1. Use only `graph_search` or `calculator`; call at most one tool this turn.
-2. Use `graph_search` for evidence retrieval; use `calculator` only for arithmetic.
-3. Prioritize explicit named entities, comparison targets, and bridge entities from QUERY_STATE + MISSING_SLOTS.
-4. For bridge questions, retrieve the intermediate person/work/entity first, then retrieve the final target attribute or relation.
-5. Do not invent dates, document types, or statement anchors that are absent from the query.
-6. Treat off-topic or weakly related evidence as non-evidence and continue retrieval.
-7. Stop when the answer is directly supported by grounded evidence or the remaining gap is explicit.
-8. TOOL_HISTORY shows prior tool calls and outcomes (new_entries, reject_reasons). Do not repeat a graph_search with the same `entities` set when the prior call yielded 0 new ledger entries; vary terms or change top_k.
-QUERY_STATE:
-{query_state}
-MISSING_SLOTS:
-{missing_slots}
-TOOL_HISTORY:
-{tool_history}
-CURRENT CONTEXT:
-{context}
-"""
