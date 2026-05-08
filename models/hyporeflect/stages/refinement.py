@@ -434,6 +434,31 @@ class RefinementOrchestrator:
                 reflection_passed = before_passed
             current_signature = self._refinement_signature(state)
             if current_signature == prev_signature:
+                # Refinement could not change the answer/critique signature
+                # — the loop has converged. If reflection still flags a
+                # critical defect that refinement cannot fix (arithmetic
+                # check fail, hallucinated cross-entity citation, or an
+                # operand_slot_mismatch that persists), preserving the
+                # confidently-wrong answer hurts hallucination metrics far
+                # more than honestly abstaining. Generic principle:
+                # "wrong with confidence is worse than honest abstain"
+                # when the system has self-detected the wrongness and
+                # cannot repair it.
+                if (not reflection_passed) and self._unfixable_defect_persists(state.reflection_meta):
+                    state.final_answer = self._build_insufficient_answer(state)
+                    reflection_passed = False
+                    append_trace(
+                        state.trace,
+                        step="refinement_force_insufficient",
+                        input={
+                            "reflection_meta": state.reflection_meta,
+                            "structural_needs_refinement": structural_needs_refinement,
+                        },
+                        output={
+                            "reason": "unfixable_defect_after_signature_convergence",
+                            "final_answer": state.final_answer,
+                        },
+                    )
                 append_trace(
                     state.trace,
                     step="refinement_early_stop",
@@ -447,4 +472,62 @@ class RefinementOrchestrator:
                 )
                 break
             prev_signature = current_signature
+
+        # Post-loop safety: even if the loop exited normally (R_max
+        # exhausted or no further refinement needed), an answer with
+        # persistent reflection-detected critical defects should fall back
+        # to insufficient.
+        if (not reflection_passed) and self._unfixable_defect_persists(state.reflection_meta):
+            if not self.execution._is_insufficient_answer(state.final_answer):
+                replaced_from = state.final_answer
+                state.final_answer = self._build_insufficient_answer(state)
+                append_trace(
+                    state.trace,
+                    step="refinement_force_insufficient",
+                    input={"reflection_meta": state.reflection_meta},
+                    output={
+                        "reason": "unfixable_defect_post_loop",
+                        "replaced_from": replaced_from[:200],
+                        "final_answer": state.final_answer,
+                    },
+                )
         return reflection_passed
+
+    # ---------- unfixable-defect detection ----------
+    _UNFIXABLE_ISSUE_TOKENS: ClassVar[tuple[str, ...]] = (
+        "operand_slot_mismatch",
+        "operand_magnitude_anomaly",
+        "formula_identity_mismatch",
+        "numeric_compute_answer_mismatch_with_calculator_result",
+        "fabricated_citation",
+    )
+
+    @classmethod
+    def _unfixable_defect_persists(cls, reflection_meta: Optional[dict[str, Any]]) -> bool:
+        """True when reflection has self-identified a defect that the
+        refinement loop has demonstrably failed to repair (signature
+        convergence + ongoing failure). Triggered on either
+        `arithmetic_check=fail` or any of the named structural defect
+        codes appearing in `issues`. Generic — no domain terms.
+        """
+        if not isinstance(reflection_meta, dict):
+            return False
+        arithmetic = str(reflection_meta.get("arithmetic_check", "") or "").strip().lower()
+        if arithmetic == "fail":
+            return True
+        issues = reflection_meta.get("issues") or []
+        if not isinstance(issues, list):
+            return False
+        for item in issues:
+            text = str(item or "").lower()
+            if not text.strip():
+                continue
+            if any(token in text for token in cls._UNFIXABLE_ISSUE_TOKENS):
+                return True
+        if cls._has_entity_critique_issue(reflection_meta):
+            return True
+        return False
+
+    @staticmethod
+    def _build_insufficient_answer(state: AgentState) -> str:
+        return "@@ANSWER: insufficient evidence"

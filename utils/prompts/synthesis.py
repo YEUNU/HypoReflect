@@ -83,7 +83,7 @@ Checks:
     - "Insufficient evidence" with the underlying intent grounded in
       CONTEXT (drivers, qualitative direction) is also a FAIL — the answer
       should report the intent-level finding rather than abstain.
-(D) Citation, entity/period, format
+(D) Citation, entity/period, format, verbatim claims
     - Hard FAIL on cross-company / cross-period citations when same-company
       / same-period evidence is present.
     - Hard FAIL on missing/invalid inline citations, multiple competing
@@ -92,6 +92,21 @@ Checks:
       explicitly requested.
     - "Insufficient evidence" with required slot coverage complete in
       EVIDENCE_LEDGER → FAIL.
+    - Verbatim-claim check: every named entity, exchange/registrar, place,
+      symbol/ticker, percentage, and dollar figure in the ANSWER must
+      appear verbatim (or as a trivial reformatting — commas, units,
+      parentheses for negatives) in CONTEXT or EVIDENCE_LEDGER. If the
+      ANSWER asserts a specific named fact that does not appear in the
+      cited chunks, FAIL with `fabricated_claim` and identify the absent
+      token. Trivial reformatting allowed; introducing entirely new
+      proper nouns or numeric values is not.
+    - Recompute-on-claim: when the ANSWER reports a numeric result for a
+      compute query, internally recompute from the operand values cited
+      in EVIDENCE_LEDGER for the queried metric's standard formula and
+      compare. If the recomputed value differs from the ANSWER's value
+      by more than the query's requested rounding, FAIL with
+      `arithmetic_check: fail` and include the recomputed value in the
+      issue text so refinement can use it.
 
 Output JSON only (no prose outside JSON).
 
