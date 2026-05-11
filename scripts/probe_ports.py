@@ -22,7 +22,10 @@ async def probe(port):
                 print(f"  {url} -> Error: {e}")
 
 async def main():
-    ports = [8000, 8001, 8002, 8003, 18082, 18083, 28000, 28001]
+    # Mirrors the services in run_servers.sh:
+    #   neo4j HTTP 7474 (separate check), gen 28000, gen2 28010, ocr 28001,
+    #   embed 18082, rerank 18083.
+    ports = [28000, 28010, 28001, 18082, 18083]
     await asyncio.gather(*(probe(p) for p in ports))
 
 if __name__ == "__main__":

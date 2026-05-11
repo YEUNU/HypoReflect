@@ -19,8 +19,17 @@ from typing import Optional
 logger = logging.getLogger("HypoReflect")
 
 
-# vLLM endpoints — fixed by run_servers.sh.
-_GEN_API_BASE = os.environ.get("RAG_MS_GEN_API_BASE", "http://localhost:28000/v1")
+# vLLM endpoints — fixed by run_servers.sh. gen=28000 (GPU 1), gen2=28010 (GPU 0).
+# Default round-robins across both so MS uses both GPUs; primary base (passed
+# as ModelConfig.api_base) is the first entry, but the LiteLLM Router monkey-
+# patch below intercepts and shuffles across all bases per call.
+_GEN_API_BASES = [
+    s.strip() for s in os.environ.get(
+        "RAG_MS_GEN_API_BASES",
+        "http://localhost:28000/v1,http://localhost:28010/v1",
+    ).split(",") if s.strip()
+]
+_GEN_API_BASE = _GEN_API_BASES[0]
 _GEN_MODEL_NAME = os.environ.get("VLLM_SERVED_MODEL_NAME", "generation-model")
 _EMBED_API_BASE = os.environ.get("RAG_MS_EMBED_API_BASE", "http://localhost:18082/v1")
 _EMBED_MODEL_NAME = os.environ.get("RAG_MS_EMBED_MODEL_NAME", "embedding-model")
@@ -124,9 +133,71 @@ def _register_local_models_with_litellm() -> None:
     })
 
 
+_ROUTER_INSTALLED = False
+
+
+def _install_litellm_router_for_gen() -> None:
+    """Monkey-patch litellm.acompletion to round-robin gen-chat across multiple
+    vLLM endpoints (28000/GPU1 + 28010/GPU0). graphrag-llm calls bare
+    `litellm.acompletion(**args)`; we intercept only when model matches our
+    local gen model and delegate to a Router with simple-shuffle. Embedding +
+    any other model passes through unchanged.
+    """
+    global _ROUTER_INSTALLED
+    if _ROUTER_INSTALLED or len(_GEN_API_BASES) <= 1:
+        return
+    import contextvars
+    import litellm
+    from litellm import Router
+
+    target = f"openai/{_GEN_MODEL_NAME}"
+    model_list = [
+        {
+            "model_name": target,
+            "litellm_params": {
+                "model": target,
+                "api_base": ab,
+                "api_key": "EMPTY",
+            },
+        }
+        for ab in _GEN_API_BASES
+    ]
+    router = Router(model_list=model_list, routing_strategy="simple-shuffle")
+
+    # Capture the ORIGINAL acompletion before we replace litellm.acompletion.
+    # Router internally calls `litellm.acompletion(...)`, which would re-enter
+    # our wrapper and recurse forever. We use a contextvar to flag "we are
+    # already inside Router" so the re-entry bypasses Router and uses the
+    # original function — which is what Router actually expects to call.
+    orig_acompletion = litellm.acompletion
+    _in_router: contextvars.ContextVar[bool] = contextvars.ContextVar(
+        "_ms_router_reentry", default=False,
+    )
+
+    async def _routed_acompletion(**kwargs):
+        if _in_router.get():
+            return await orig_acompletion(**kwargs)
+        if kwargs.get("model") == target:
+            kwargs.pop("api_base", None)
+            token = _in_router.set(True)
+            try:
+                return await router.acompletion(**kwargs)
+            finally:
+                _in_router.reset(token)
+        return await orig_acompletion(**kwargs)
+
+    litellm.acompletion = _routed_acompletion
+    _ROUTER_INSTALLED = True
+    logger.info(
+        "MS LiteLLM router installed for %s across %d endpoints: %s",
+        target, len(_GEN_API_BASES), _GEN_API_BASES,
+    )
+
+
 def build_config(corpus_tag: str, staged_input_dir: Path):
     """Construct a GraphRagConfig pointing LiteLLM at our local vLLM."""
     _register_local_models_with_litellm()
+    _install_litellm_router_for_gen()
 
     from graphrag.config.models.graph_rag_config import GraphRagConfig
     from graphrag_cache import CacheConfig
@@ -200,8 +271,10 @@ def build_config(corpus_tag: str, staged_input_dir: Path):
             },
         ),
     )
-    # Keep concurrency reasonable so we don't starve the rest of the system.
-    cfg.concurrent_requests = int(os.environ.get("RAG_MS_CONCURRENT_REQUESTS", "16"))
+    # MS pipeline gates extract_graph + summarize via asyncio.Semaphore(num_threads=concurrent_requests).
+    # vLLM 4B handles 30+ parallel reqs comfortably (peak observed: 14 running + 7 waiting at limit 16
+    # → fully saturated). Bump to 48 to drive the queue and shave wall-clock on the 33k-text_unit corpus.
+    cfg.concurrent_requests = int(os.environ.get("RAG_MS_CONCURRENT_REQUESTS", "48"))
     return cfg
 
 

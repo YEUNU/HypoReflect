@@ -12,7 +12,7 @@ The HypoReflect strategy implements a five-stage pipeline:
 
 `Perception → Planning → Execution → Reflection → Refinement`
 
-- **Perception, Planning, Execution**: local vLLM (Qwen 4B-class), served at `:28000` (and `:28010` if `VLLM_URL_2` is set — round-robin'd by `VLLMClient`).
+- **Perception, Planning, Execution**: local vLLM (Qwen 4B-class), served at `:28000` (and `:28010` if `VLLM_URL_2` is set — round-robin'd by `VLLMClient`). `run_servers.sh` pins `gen` to CUDA 1 (port 28000) and `gen2` to CUDA 0 (port 28010); `embed` shares CUDA 0, `reranker` shares CUDA 1.
 - **Reflection, Refinement**: `gpt-5.4-mini-2026-03-17` via OpenAI API by default (`REFLECTION_MODEL` / `REFINEMENT_MODEL` in `.env`). The local 4B model degrades these stages — empirically judge 0.25 / hallucination 0.36 vs 0.34 / 0.16 with GPT — and the new verbatim-claim and recompute-on-claim reflection rules require careful instruction following that the 4B does not deliver. Set those vars to empty if you intentionally want all-local for an ablation.
 - **LLM-as-judge evaluation**: `gpt-5.5-2026-04-23` (`EVAL_MODEL`). The judge produces both correctness score AND hallucination flag in a single combined LLM call (consolidated from two separate calls; `HALLUCINATION_EVAL_MODEL` was removed from `RAGConfig`). The judge also deterministically marks honest "insufficient evidence" abstentions as hallucination=0 even when GT is substantive — the LLM cannot override.
 
@@ -47,6 +47,9 @@ The `models/hyporeflect/` tree mirrors the paper's two pipelines (offline §3.1,
   - `state.py`, `trace.py`, `schemas.py` — shared state/trace types.
 - `models/agentic_core/` — shared agentic orchestrator (`orchestrator.py`, `full_stage_backend.py`) usable by non-hyporeflect strategies via `--agentic on`.
 - `models/{naive,hoprag,ms_graphrag}/` — baseline strategies; each owns its own indexing/retrieval. Selected by `--strategy`/`--model`.
+  - `models/ms_graphrag/official_indexer.py` — wraps `graphrag.api.build_index` (Standard pipeline). When `RAG_MS_GEN_API_BASES` lists more than one URL, it installs a `litellm.Router` (`simple-shuffle`) via monkey-patch of `litellm.acompletion`, with a `contextvars.ContextVar` re-entry guard so the Router's own internal calls don't recurse. Outputs parquet under `data/ms_graphrag_output/<corpus_tag>/` + a lancedb vector store. Concurrency capped by `RAG_MS_CONCURRENT_REQUESTS` (default 48).
+  - `models/ms_graphrag/ms_adapter.py` — query-time adapter; reads `community_reports.parquet`, `entities.parquet`, `text_units.parquet` directly. Does **not** require Neo4j Community nodes.
+  - `models/hoprag/official_indexer.py` — drives `third_party/HopRAG/HopBuilder.QABuilder`. paddlenlp NER is stubbed and replaced with spaCy `en_core_web_sm`.
 - `utils/prompts/` — externalized prompt templates (e.g. `RERANKER_INSTRUCTION`); always source prompts from here, do not inline.
 - `tools/benchmark_report.py` — post-processes `data/results/<timestamp>/...` after a benchmark run.
 
@@ -61,13 +64,13 @@ The `models/hyporeflect/` tree mirrors the paper's two pipelines (offline §3.1,
 
 ## Commands
 
-Service orchestration (Neo4j + vLLM gen/ocr/embed/rerank on ports 7474/7687, 28000, 28001, 18082, 18083):
+Service orchestration (Neo4j 7474/7687 + vLLM `gen` 28000 / `gen2` 28010 / `ocr` 28001 / `embed` 18082 / `rerank` 18083):
 
 ```bash
-./run_servers.sh all          # start all
-./run_servers.sh {neo4j|gen|ocr|embed|rerank}
+./run_servers.sh all          # start all (including gen2)
+./run_servers.sh {neo4j|gen|gen2|ocr|embed|rerank}
 ./stop_servers.sh all
-python3 scripts/probe_ports.py        # quick port check
+python3 scripts/probe_ports.py        # quick port check (covers 28000/28010/28001/18082/18083)
 python3 scripts/check_env.py          # env sanity check
 ```
 
@@ -87,6 +90,15 @@ python main.py --mode index --strategy hyporeflect --sample --ocr --corpus-tag s
 python main.py --mode benchmark --strategy hyporeflect --queries_file data/financebench_queries.json --corpus-tag sample_ocr
 python main.py --mode benchmark_all --sample        # iterates all four strategies
 ```
+
+Full paper experiment (canonical, end-to-end — see `README.md` "Reproducing the paper experiments"):
+
+```bash
+./run_all_indexing_parallel.sh --full         # 7 indexes: 3 baselines × full + 4 hyporeflect (full + 3 ablations)
+./run_all_benchmark_parallel.sh --full        # up to 12 benches (paper Table 1 + agentic_on variants)
+```
+
+The matrices intentionally exclude baseline ablations (`naive_no_*`, `hoprag_no_*`, `ms_graphrag_no_*`) — see "ablation flag scope" below.
 
 Per-run env overrides (preferred for one-off ablations — leaves `.env` untouched):
 
@@ -125,6 +137,12 @@ Retrieval/indexing:
 Ablations (each toggles one paper-relevant component):
 - `RAG_ABLATION_TABLE`, `RAG_ABLATION_CHUNKING`, `RAG_ABLATION_SUMMARY`, `RAG_ENABLE_REFLECTION`
 
+**Ablation flag scope (important):** `RAG_ABLATION_TABLE/CHUNKING/SUMMARY` are read only by `models/hyporeflect/indexing/chunking.py` (and `naive_rag.py` purely as a cache-namespace key — no behavior change). The `hoprag` and `ms_graphrag` baselines run their published indexing pipelines verbatim and **ignore these flags**; setting them on a baseline run yields an index identical to the `_full` variant. The catchup/parallel scripts only run ablations on HypoReflect — do not reintroduce baseline ablations.
+
+MS GraphRAG runtime knobs (read by `models/ms_graphrag/official_indexer.py`):
+- `RAG_MS_GEN_API_BASES` — comma-separated vLLM gen URLs (default `28000+28010`). >1 entry triggers the LiteLLM Router monkey-patch.
+- `RAG_MS_CONCURRENT_REQUESTS` — `asyncio.Semaphore` size for `extract_graph` and `summarize_descriptions` (default 48).
+
 Benchmark gate (fails the run if metrics fall below thresholds):
 - `RAG_BENCHMARK_GATE`, `RAG_GATE_MAX_LATENCY`, `RAG_GATE_MIN_LLM_JUDGE`, `RAG_GATE_MIN_DOC_MATCH`
 
@@ -144,6 +162,7 @@ Each result JSON contains averaged metrics, per-query `details`, category breakd
 - The full pipeline is reachable via `AgentService.run_workflow` (`models/hyporeflect/service.py`), which delegates to `Orchestrator` (`models/hyporeflect/orchestrator.py`). The R_max=2 refinement loop and lexicographic non-regression guard live in `RefinementOrchestrator` inside `stages/refinement.py` — that's the test patch point (`service._orchestrator.refinement_loop.run_loop`), not `service._run_refinement_loop` (which no longer exists).
 - Always close drivers cleanly: `main.py` calls `Neo4jService.global_close()` and `VLLMClient.global_close()` in a `finally` block. New entry points should do the same.
 - Ports are fixed (see Services section); changing them requires updating `run_servers.sh`, `scripts/probe_ports.py`, and any client URLs.
+- The MS GraphRAG LiteLLM Router monkey-patch (`official_indexer.py::_install_litellm_router_for_gen`) needs a `contextvars.ContextVar` re-entry guard. `Router.acompletion` internally calls `litellm.acompletion`; without the guard the patched function recurses to RecursionError. The guard sets a contextvar on entry, checks it on every call, and bypasses to the original `acompletion` while it's True.
 - Do not introduce new benchmarks; FinanceBench is the only target.
 - Domain-specific post-refinement override builders (operating-margin/segment-drag/quick-ratio/debt-securities/capital-intensity/dividend-stability) were removed during the paper-aligned refactor. Don't reintroduce them — they were FinanceBench-specific patches not in the paper.
 

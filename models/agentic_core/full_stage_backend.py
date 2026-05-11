@@ -23,10 +23,22 @@ class RetrievalGraphAdapter:
         base_k = default_top_k if default_top_k is not None else RAGConfig.DEFAULT_TOP_K
         self.default_top_k = max(1, int(base_k))
 
-    async def graph_search(self, entities: List[str], depth: int = 2, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
-        _ = depth
-        query_parts = [str(e).strip() for e in (entities or []) if str(e).strip()]
-        query = " ".join(query_parts).strip()
+    async def graph_search(
+        self,
+        entities: List[str],
+        depth: int = 2,
+        top_k: int = 5,
+        user_query: str = "",
+        excluded_chunk_ids: Any = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        # depth/excluded_chunk_ids are hyporeflect-specific knobs that ms/hoprag
+        # adapters don't understand; user_query is a richer context that the
+        # backend's own .retrieve() may already derive from entity-joined query.
+        # Prefer user_query if available (more information), else fall back
+        # to entity concat to keep behaviour identical to the previous version.
+        _ = depth, excluded_chunk_ids
+        query = (str(user_query or "").strip()
+                 or " ".join(str(e).strip() for e in (entities or []) if str(e).strip()).strip())
         if not query:
             return "", []
 
