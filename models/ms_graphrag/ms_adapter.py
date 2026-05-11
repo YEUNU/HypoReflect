@@ -1,97 +1,28 @@
 """
 [MS GraphRAG] adapter wired to official GlobalSearch/LocalSearch classes.
 
-This keeps benchmark compatibility while using the upstream Microsoft query
-orchestration code and preserving current generation/rerank model services.
+Reads parquet artifacts produced by official_indexer.py (data/ms_graphrag_output/
+<corpus_tag>/{entities,communities,community_reports,text_units}.parquet) and
+hands snapshots to upstream Microsoft query orchestration. Models route through
+our local vLLM via the existing VLLMClient.
 """
 
 import importlib
-import json
 import logging
 import os
 from pathlib import Path
-import sys
-import types
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
-from core.neo4j_service import Neo4jService
 from core.vllm_client import VLLMClient, get_llm_client
+from models.ms_graphrag.official_indexer import output_dir_for
 
 logger = logging.getLogger(__name__)
 
 
-def _install_ms_optional_stubs() -> None:
-    """Install tiny import-time stubs for optional upstream dependencies."""
-    if "nest_asyncio2" not in sys.modules:
-        nest_asyncio2 = types.ModuleType("nest_asyncio2")
-        nest_asyncio2.apply = lambda: None  # type: ignore[attr-defined]
-        sys.modules["nest_asyncio2"] = nest_asyncio2
-
-    if "pandas" not in sys.modules:
-        pandas = types.ModuleType("pandas")
-
-        class _DataFrame(list):
-            def __init__(self, data=None, *args, **kwargs):
-                _ = args, kwargs
-                super().__init__(data if isinstance(data, list) else [])
-
-            @property
-            def columns(self):
-                return []
-
-        pandas.DataFrame = _DataFrame  # type: ignore[attr-defined]
-        sys.modules["pandas"] = pandas
-
-    if "litellm" not in sys.modules:
-        litellm = types.ModuleType("litellm")
-        litellm.AnthropicThinkingParam = dict  # type: ignore[attr-defined]
-        litellm.ChatCompletionAudioParam = dict  # type: ignore[attr-defined]
-        litellm.ChatCompletionModality = str  # type: ignore[attr-defined]
-        litellm.ChatCompletionPredictionContentParam = dict  # type: ignore[attr-defined]
-        litellm.OpenAIWebSearchOptions = dict  # type: ignore[attr-defined]
-        litellm.ModelResponse = object  # type: ignore[attr-defined]
-        litellm.model_cost = {}  # type: ignore[attr-defined]
-        litellm.supports_response_schema = lambda *_a, **_kw: False  # type: ignore[attr-defined]
-        litellm.encode = lambda _model, text: [ord(ch) for ch in str(text)]  # type: ignore[attr-defined]
-        litellm.decode = lambda _model, tokens: "".join(chr(int(t)) for t in tokens)  # type: ignore[attr-defined]
-
-        litellm_exceptions = types.ModuleType("litellm.exceptions")
-        for exc_name in [
-            "APIError",
-            "AuthenticationError",
-            "BadRequestError",
-            "RateLimitError",
-            "ServiceUnavailableError",
-            "Timeout",
-        ]:
-            setattr(litellm_exceptions, exc_name, type(exc_name, (Exception,), {}))
-
-        litellm.exceptions = litellm_exceptions  # type: ignore[attr-defined]
-        sys.modules["litellm"] = litellm
-        sys.modules["litellm.exceptions"] = litellm_exceptions
-
-    if "json_repair" not in sys.modules:
-        json_repair = types.ModuleType("json_repair")
-        json_repair.repair_json = lambda text, **_kwargs: text  # type: ignore[attr-defined]
-        sys.modules["json_repair"] = json_repair
-
-
-def _append_ms_package_paths() -> None:
-    root = Path(__file__).resolve().parents[2] / "third_party" / "MS_GraphRAG" / "packages"
-    package_dirs = [p for p in root.iterdir() if p.is_dir()] if root.exists() else []
-    for p in package_dirs:
-        if p.exists():
-            p_str = str(p)
-            if p_str not in sys.path:
-                sys.path.insert(0, p_str)
-
-
 def _load_official_ms_components() -> Dict[str, Any]:
-    _install_ms_optional_stubs()
-    _append_ms_package_paths()
-
     global_search_module = importlib.import_module(
         "graphrag.query.structured_search.global_search.search"
     )
@@ -114,39 +45,51 @@ def _load_official_ms_components() -> Dict[str, Any]:
 
 class _SimpleTokenizer:
     def encode(self, text: str):
-        if not text:
-            return []
-        return list(range(len(str(text).split())))
+        return [ord(ch) for ch in str(text or "")]
 
-
-class _SimpleChoiceMessage:
-    def __init__(self, content: str):
-        self.content = content
-
-
-class _SimpleChoiceDelta:
-    def __init__(self, content: str):
-        self.content = content
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids if isinstance(i, int))
 
 
 class _SimpleResponseChoice:
     def __init__(self, content: str):
-        self.message = _SimpleChoiceMessage(content)
+        self.message = type("M", (), {"content": content})()
 
 
-class _SimpleChunkChoice:
+class _SimpleStreamChunkChoice:
     def __init__(self, content: str):
-        self.delta = _SimpleChoiceDelta(content)
+        self.delta = type("D", (), {"content": content})()
+
+
+class _SimpleStreamChunk:
+    def __init__(self, content: str):
+        self.choices = [_SimpleStreamChunkChoice(content)]
 
 
 class _SimpleResponse:
+    """Behaves as both a non-streaming response (.choices[0].message.content)
+    AND an async iterator (yields one chunk with full content). graphrag 3.0.1
+    LocalSearch.search uses `async for chunk in response`; GlobalSearch uses
+    response.choices[0].message.content directly. One class covers both."""
+
     def __init__(self, content: str):
         self.choices = [_SimpleResponseChoice(content)]
+        self.content = content
+
+    def __aiter__(self):
+        return self._stream()
+
+    async def _stream(self):
+        yield _SimpleStreamChunk(self.content)
 
 
 class _OfficialCompletionBridge:
-    """
-    Minimal LLMCompletion-compatible object for official GraphRAG search classes.
+    """Minimal LLMCompletion-compatible adapter for the official GraphRAG search classes.
+
+    Library quirk: GlobalSearch._map_response_single_batch passes
+    response_format_json_object=True both explicitly AND via **map_llm_params
+    (which it pre-populated when json_mode=True). That raises a duplicate-kwarg
+    TypeError. We swallow the duplicate at the bridge.
     """
 
     def __init__(self, llm_client):
@@ -154,30 +97,22 @@ class _OfficialCompletionBridge:
         self.tokenizer = _SimpleTokenizer()
 
     async def completion_async(self, /, **kwargs):
+        kwargs.pop("response_format", None)
+        wants_json = bool(kwargs.pop("response_format_json_object", False))
+
         messages = kwargs.get("messages", [])
-        stream = bool(kwargs.get("stream", False))
         temperature = float(kwargs.get("temperature", 0.0) or 0.0)
-        wants_json = bool(kwargs.get("response_format_json_object")) or (
-            kwargs.get("response_format") is not None
-        )
 
         if wants_json:
             payload = await self._llm.generate_json(messages, temperature=temperature)
             if not isinstance(payload, dict):
                 payload = {"points": []}
-            return _SimpleResponse(json.dumps(payload, ensure_ascii=False))
+            import json as _json
+            return _SimpleResponse(_json.dumps(payload, ensure_ascii=False))
 
         text = await self._llm.generate_response(messages, temperature=temperature)
-        if not isinstance(text, str):
-            text = str(text or "")
+        return _SimpleResponse(str(text or ""))
 
-        if stream:
-            async def _gen():
-                yield types.SimpleNamespace(choices=[_SimpleChunkChoice(text)])
-
-            return _gen()
-
-        return _SimpleResponse(text)
 
 def _create_snapshot_builders(components: Dict[str, Any]):
     result_cls = components["ContextBuilderResult"]
@@ -198,9 +133,7 @@ def _create_snapshot_builders(components: Dict[str, Any]):
             return result_cls(
                 context_chunks=list(self._chunks),
                 context_records=dict(self._records),
-                llm_calls=0,
-                prompt_tokens=0,
-                output_tokens=0,
+                llm_calls=0, prompt_tokens=0, output_tokens=0,
             )
 
     class SnapshotLocalContextBuilder(local_base):
@@ -217,35 +150,44 @@ def _create_snapshot_builders(components: Dict[str, Any]):
             return result_cls(
                 context_chunks=self._chunk,
                 context_records=dict(self._records),
-                llm_calls=0,
-                prompt_tokens=0,
-                output_tokens=0,
+                llm_calls=0, prompt_tokens=0, output_tokens=0,
             )
 
     return SnapshotGlobalContextBuilder, SnapshotLocalContextBuilder
 
 
+def _to_markdown_table(rows: List[Dict[str, Any]], columns: List[str]) -> str:
+    header = "| " + " | ".join(columns) + " |"
+    sep = "| " + " | ".join(["---"] * len(columns)) + " |"
+    body = []
+    for row in rows:
+        values = []
+        for col in columns:
+            text = str(row.get(col, "")).replace("\n", " ").replace("|", " ")
+            values.append(text[:1200])
+        body.append("| " + " | ".join(values) + " |")
+    return "\n".join([header, sep] + body)
+
+
 class MSGraphRAGAdapter:
-    """
-    MS GraphRAG benchmark adapter:
-    - Uses official GlobalSearch/LocalSearch search orchestration
-    - Keeps current model endpoints (generation + rerank)
-    - Keeps benchmark-compatible return type (answer, sources, trace)
+    """MS GraphRAG benchmark adapter (parquet-backed).
+
+    Indexing artifacts come from official MS pipeline (run_official_index in
+    official_indexer.py). Query path uses official GlobalSearch/LocalSearch
+    with snapshot builders fed by parquet + on-the-fly embedding.
     """
 
     def __init__(self, model_id: str = "local", corpus_tag: str = "default"):
         self.llm = get_llm_client(model_id)
         self.vllm = VLLMClient(model_name=model_id)
-        self.neo4j = Neo4jService()
         self.corpus_tag = corpus_tag
+        self.output_dir = output_dir_for(corpus_tag)
 
-        self.prefix = "MS_"
-        import re as _re
-        _safe_corpus = _re.sub(r"[^A-Za-z0-9_]", "_", self.corpus_tag)
-        self.chunk_label = f"{self.prefix}{_safe_corpus}_Chunk"
-        self.community_label = f"{self.prefix}{_safe_corpus}_Community"
-        self.doc_label = f"{self.prefix}{_safe_corpus}_Document"
-        self.vector_index = f"ms_graphrag_{_safe_corpus}_vector_idx"
+        # Lazy-load parquet on first query.
+        self._community_reports: Optional[pd.DataFrame] = None
+        self._entities: Optional[pd.DataFrame] = None
+        self._text_units: Optional[pd.DataFrame] = None
+        self._text_unit_embeds: Optional[np.ndarray] = None  # cached corpus embeddings
 
         components = _load_official_ms_components()
         self._no_data_answer = components["NO_DATA_ANSWER"]
@@ -255,6 +197,8 @@ class MSGraphRAGAdapter:
         self._local_builder = local_builder_cls()
         self._official_model = _OfficialCompletionBridge(self.llm)
 
+        # json_mode=False: bridge handles JSON unconditionally and avoids the
+        # library's response_format_json_object duplicate-kwarg trap.
         self._global_search = components["GlobalSearch"](
             model=self._official_model,
             context_builder=self._global_builder,
@@ -264,6 +208,7 @@ class MSGraphRAGAdapter:
             map_llm_params={"temperature": 0.0},
             reduce_llm_params={"temperature": 0.1},
             concurrent_coroutines=8,
+            json_mode=False,
         )
         self._local_search = components["LocalSearch"](
             model=self._official_model,
@@ -274,38 +219,41 @@ class MSGraphRAGAdapter:
         self._agentic_runner = None
         self._agentic_full_service = None
 
+    # ------------------------------------------------------------------ parquet I/O
+
+    def _read_parquet(self, name: str) -> pd.DataFrame:
+        path = self.output_dir / f"{name}.parquet"
+        if not path.exists():
+            logger.warning("MS parquet missing: %s", path)
+            return pd.DataFrame()
+        return pd.read_parquet(path)
+
+    def _ensure_loaded(self) -> None:
+        if self._community_reports is None:
+            self._community_reports = self._read_parquet("community_reports")
+        if self._entities is None:
+            self._entities = self._read_parquet("entities")
+        if self._text_units is None:
+            self._text_units = self._read_parquet("text_units")
+
+    # ------------------------------------------------------------------ snapshots
+
     async def _get_community_summaries(self) -> List[Dict[str, Any]]:
-        async with self.neo4j.driver.session() as session:
-            query = f"""
-                MATCH (c:{self.community_label})
-                RETURN c.id AS id, c.summary AS summary, c.entities AS entities, c.title AS title
-            """
-            result = await session.run(query)  # type: ignore
-            summaries = [dict(rec) async for rec in result]
-            if summaries:
-                return summaries
-
-            fallback_query = f"""
-                MATCH (d:{self.doc_label})
-                WHERE d.summary IS NOT NULL
-                RETURN d.filename AS id, d.title AS title, d.summary AS summary
-                LIMIT 30
-            """
-            result = await session.run(fallback_query)  # type: ignore
-            return [dict(rec) async for rec in result]
-
-    @staticmethod
-    def _to_markdown_table(rows: List[Dict[str, Any]], columns: List[str]) -> str:
-        header = "| " + " | ".join(columns) + " |"
-        sep = "| " + " | ".join(["---"] * len(columns)) + " |"
-        body: List[str] = []
-        for row in rows:
-            values = []
-            for col in columns:
-                text = str(row.get(col, "")).replace("\n", " ").replace("|", " ")
-                values.append(text[:1200])
-            body.append("| " + " | ".join(values) + " |")
-        return "\n".join([header, sep] + body)
+        self._ensure_loaded()
+        df = self._community_reports
+        if df is None or df.empty:
+            return []
+        # Newest schema: id, community, level, title, summary, full_content, rank, ...
+        records: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            records.append({
+                "id": str(row.get("community", row.get("id", ""))),
+                "title": str(row.get("title", "") or ""),
+                "summary": str(row.get("summary", "") or row.get("full_content", "") or ""),
+                "rank": float(row.get("rank", 0.0) or 0.0),
+                "level": int(row.get("level", 0) or 0),
+            })
+        return records
 
     async def _prepare_global_snapshot(self, query: str) -> List[Dict[str, Any]]:
         summaries = await self._get_community_summaries()
@@ -315,40 +263,35 @@ class MSGraphRAGAdapter:
 
         query_embed_list = await self.vllm.get_embedding(query)
         if not query_embed_list:
-            self._global_builder.set_snapshot([], {"reports": []})
-            return []
+            # Fall back to rank-only ordering if embedding unavailable.
+            relevant = sorted(summaries, key=lambda s: s.get("rank", 0.0), reverse=True)[:10]
+        else:
+            summary_texts = [s["summary"] for s in summaries if s["summary"]]
+            summary_embeds = await self.vllm.get_embeddings(summary_texts)
+            if not summary_embeds:
+                relevant = sorted(summaries, key=lambda s: s.get("rank", 0.0), reverse=True)[:10]
+            else:
+                qv = np.array(query_embed_list, dtype=np.float32)
+                qn = float(np.linalg.norm(qv)) + 1e-8
+                scored: List[Tuple[Dict[str, Any], float]] = []
+                ei = 0
+                for item in summaries:
+                    if not item["summary"]:
+                        continue
+                    sv = np.array(summary_embeds[ei], dtype=np.float32)
+                    ei += 1
+                    sn = float(np.linalg.norm(sv)) + 1e-8
+                    sim = float(np.dot(qv, sv) / (qn * sn))
+                    # Combine cosine sim with community rank (light weighting).
+                    scored.append((item, sim + 0.05 * item.get("rank", 0.0)))
+                scored.sort(key=lambda x: x[1], reverse=True)
+                relevant = [item for item, _ in scored[:10]]
 
-        summary_texts = [str(s.get("summary", "") or "") for s in summaries if s.get("summary")]
-        if not summary_texts:
-            self._global_builder.set_snapshot([], {"reports": []})
-            return []
-
-        summary_embeds_list = await self.vllm.get_embeddings(summary_texts)
-        if not summary_embeds_list:
-            self._global_builder.set_snapshot([], {"reports": []})
-            return []
-
-        query_embed = np.array(query_embed_list)
-        query_norm = float(np.linalg.norm(query_embed)) + 1e-8
-
-        scored: List[Tuple[Dict[str, Any], float]] = []
-        embed_idx = 0
-        for item in summaries:
-            summary = str(item.get("summary", "") or "")
-            if not summary:
-                continue
-            summary_embed = np.array(summary_embeds_list[embed_idx])
-            embed_idx += 1
-            summary_norm = float(np.linalg.norm(summary_embed)) + 1e-8
-            score = float(np.dot(query_embed, summary_embed) / (query_norm * summary_norm))
-            scored.append((item, score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        relevant = [item for item, _ in scored[:10]]
         if not relevant:
             self._global_builder.set_snapshot([], {"reports": []})
             return []
 
+        # Pack in batches of 5 for the global Map step.
         context_chunks: List[str] = []
         batch_size = 5
         for offset in range(0, len(relevant), batch_size):
@@ -356,58 +299,79 @@ class MSGraphRAGAdapter:
             rows = []
             for idx, item in enumerate(batch, start=1):
                 rows.append({
-                    "report_id": f"{offset + idx}",
-                    "title": item.get("title", item.get("id", "Unknown")),
-                    "summary": item.get("summary", ""),
+                    "report_id": str(offset + idx),
+                    "title": item["title"] or item["id"],
+                    "summary": item["summary"],
                 })
-            table = self._to_markdown_table(rows, ["report_id", "title", "summary"])
-            context_chunks.append(table)
+            context_chunks.append(_to_markdown_table(rows, ["report_id", "title", "summary"]))
 
         self._global_builder.set_snapshot(context_chunks, {"reports": relevant})
         return relevant
 
     async def _prepare_local_snapshot(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Local search: embed all text_units (one-time), cosine-rank against
+        the query, then rerank top candidates and feed top_k to LocalSearch.
+        """
+        self._ensure_loaded()
+        df = self._text_units
+        if df is None or df.empty:
+            self._local_builder.set_snapshot("", {"sources": []})
+            return []
+
         query_embed = await self.vllm.get_embedding(query)
         if not query_embed:
             self._local_builder.set_snapshot("", {"sources": []})
             return []
 
-        async with self.neo4j.driver.session() as session:
-            query_cypher = f"""
-                CALL db.index.vector.queryNodes('{self.vector_index}', $k, $embedding)
-                YIELD node, score
-                RETURN node.title AS title, node.sent_id AS sent_id, node.page AS page,
-                       node.text AS text, node.source AS source, score
-            """
-            result = await session.run(query_cypher, {  # type: ignore
-                "k": max(top_k * 3, 15),
-                "embedding": query_embed,
+        if self._text_unit_embeds is None:
+            texts = [str(t or "") for t in df["text"].tolist()]
+            embeds = await self.vllm.get_embeddings(texts)
+            self._text_unit_embeds = np.array(embeds, dtype=np.float32)
+            logger.info(
+                "MS local-snapshot: cached %d text_unit embeddings for %s",
+                len(texts), self.corpus_tag,
+            )
+
+        qv = np.array(query_embed, dtype=np.float32)
+        qn = float(np.linalg.norm(qv)) + 1e-8
+        sims = self._text_unit_embeds @ qv / (
+            np.linalg.norm(self._text_unit_embeds, axis=1) * qn + 1e-8
+        )
+        ann_k = max(top_k * 3, 15)
+        top_idx = np.argsort(-sims)[:ann_k]
+        cand = df.iloc[top_idx].copy()
+        cand["ann_score"] = sims[top_idx]
+
+        texts = cand["text"].astype(str).tolist()
+        rerank_scores = await self.vllm.rerank(query, texts)
+        cand["rerank_score"] = rerank_scores
+        cand = cand.sort_values("rerank_score", ascending=False).head(top_k)
+
+        nodes: List[Dict[str, Any]] = []
+        for _, r in cand.iterrows():
+            nodes.append({
+                "title": str(r.get("document_id", "") or "")[:80],
+                "page": 0,
+                "sent_id": int(r.get("human_readable_id", 0) or 0),
+                "text": str(r.get("text", "") or ""),
+                "source": str(r.get("document_id", "") or ""),
+                "rerank_score": float(r.get("rerank_score", 0.0) or 0.0),
             })
-            nodes = [dict(rec) async for rec in result]
-
-        if not nodes:
-            self._local_builder.set_snapshot("", {"sources": []})
-            return []
-
-        texts = [str(n.get("text", "")) for n in nodes]
-        scores = await self.vllm.rerank(query, texts)
-        for idx, score in enumerate(scores):
-            if idx < len(nodes):
-                nodes[idx]["rerank_score"] = score
-        nodes = sorted(nodes, key=lambda x: x.get("rerank_score", 0.0), reverse=True)[:top_k]
 
         rows = []
-        for idx, node in enumerate(nodes, start=1):
+        for idx, n in enumerate(nodes, start=1):
             rows.append({
                 "id": idx,
-                "title": node.get("title", ""),
-                "page": node.get("page", 0),
-                "chunk": node.get("sent_id", 0),
-                "text": str(node.get("text", ""))[:1400],
+                "title": n["title"],
+                "page": n["page"],
+                "chunk": n["sent_id"],
+                "text": n["text"][:1400],
             })
-        context_table = self._to_markdown_table(rows, ["id", "title", "page", "chunk", "text"])
+        context_table = _to_markdown_table(rows, ["id", "title", "page", "chunk", "text"])
         self._local_builder.set_snapshot(context_table, {"sources": nodes})
         return nodes
+
+    # ------------------------------------------------------------------ search APIs
 
     async def global_search(self, query: str) -> Tuple[str, List, List]:
         relevant = await self._prepare_global_snapshot(query)
@@ -416,15 +380,12 @@ class MSGraphRAGAdapter:
 
         result = await self._global_search.search(query)
         answer = str(result.response or "").strip() or self._no_data_answer
-        sources = [
-            {
-                "doc": item.get("title", item.get("id", "Community")),
-                "page": 0,
-                "text": item.get("summary", ""),
-                "sent_id": 0,
-            }
-            for item in relevant
-        ]
+        sources = [{
+            "doc": item["title"] or item["id"],
+            "page": 0,
+            "text": item["summary"],
+            "sent_id": 0,
+        } for item in relevant]
         trace = [{
             "step": "ms_global_official_search",
             "llm_calls": result.llm_calls,
@@ -440,15 +401,10 @@ class MSGraphRAGAdapter:
 
         result = await self._local_search.search(query)
         answer = str(result.response or "").strip()
-        sources = [
-            {
-                "doc": n.get("title", ""),
-                "page": n.get("page", 0),
-                "text": n.get("text", ""),
-                "sent_id": n.get("sent_id", 0),
-            }
-            for n in nodes
-        ]
+        sources = [{
+            "doc": n["title"], "page": n["page"],
+            "text": n["text"], "sent_id": n["sent_id"],
+        } for n in nodes]
         trace = [{
             "step": "ms_local_official_search",
             "llm_calls": result.llm_calls,
@@ -461,14 +417,9 @@ class MSGraphRAGAdapter:
         nodes = await self._prepare_local_snapshot(query, top_k=top_k)
         if not nodes:
             return "", []
-
-        blocks: List[str] = []
-        for node in nodes:
-            title = str(node.get("title", "") or "")
-            page = int(node.get("page") or 0)
-            sent_id = int(node.get("sent_id") or 0)
-            text = str(node.get("text", "") or "")
-            blocks.append(f"[[{title}, Page {page}, Chunk {sent_id}]]\n{text}")
+        blocks = []
+        for n in nodes:
+            blocks.append(f"[[{n['title']}, Page {n['page']}, Chunk {n['sent_id']}]]\n{n['text']}")
         return "\n\n---\n\n".join(blocks), nodes
 
     async def run_workflow(self, query: str, history: Optional[List[Dict]] = None) -> Tuple[str, List, List]:
@@ -478,42 +429,28 @@ class MSGraphRAGAdapter:
             if agentic_pipeline == "lite":
                 if self._agentic_runner is None:
                     from models.agentic_core import AgenticOrchestrator
-
                     self._agentic_runner = AgenticOrchestrator(
-                        llm=self.llm,
-                        backend=self,
-                        strategy_name="ms_graphrag",
-                        top_k=5,
+                        llm=self.llm, backend=self,
+                        strategy_name="ms_graphrag", top_k=5,
                     )
                 return await self._agentic_runner.run(query, history)
 
             if self._agentic_full_service is None:
                 from models.agentic_core import RetrievalGraphAdapter
                 from models.hyporeflect.service import AgentService
-
                 graph_adapter = RetrievalGraphAdapter(
-                    backend=self,
-                    strategy_name="ms_graphrag",
-                    default_top_k=5,
+                    backend=self, strategy_name="ms_graphrag", default_top_k=5,
                 )
                 self._agentic_full_service = AgentService(
-                    strategy="hyporeflect",
-                    corpus_tag=self.corpus_tag,
-                    llm_override=self.llm,
-                    grag_override=graph_adapter,
+                    strategy="hyporeflect", corpus_tag=self.corpus_tag,
+                    llm_override=self.llm, grag_override=graph_adapter,
                 )
             return await self._agentic_full_service.run_workflow(query, history)
 
         _ = history
         abstract_keywords = [
-            "overall",
-            "summary",
-            "main themes",
-            "in general",
-            "relationship between",
-            "high-level",
-            "broadly",
-            "across documents",
+            "overall", "summary", "main themes", "in general",
+            "relationship between", "high-level", "broadly", "across documents",
         ]
         is_global = any(kw in query.lower() for kw in abstract_keywords)
         if is_global:

@@ -42,7 +42,33 @@ async def run_indexing(
         len(sample_companies) if sample_companies else 0,
     )
 
-    if strategy in ["hyporeflect", "hoprag", "ms_graphrag"]:
+    if strategy == "ms_graphrag":
+        # Official MS GraphRAG pipeline (extract_graph + Leiden + community
+        # reports), routed through LiteLLM → local vLLM. Outputs parquet
+        # under data/ms_graphrag_output/<corpus_tag>/. Skips our chunking/
+        # HOP/summary stages — MS does its own.
+        from models.ms_graphrag.official_indexer import run_official_index as run_ms_index
+        await run_ms_index(
+            dataset_path=dataset_path,
+            corpus_tag=corpus_tag or "default",
+            sample_companies=sample_companies,
+        )
+        return
+
+    if strategy == "hoprag":
+        # Official HopRAG indexing (QABuilder.create_nodes + grouped
+        # create_edge + create_index). Routed through OpenAI client → local
+        # vLLM, embeddings via vLLM HTTP. Writes nodes/edges directly to
+        # Neo4j under HO_<corpus_tag>_* labels.
+        from models.hoprag.official_indexer import run_official_index as run_hop_index
+        await run_hop_index(
+            dataset_path=dataset_path,
+            corpus_tag=corpus_tag or "default",
+            sample_companies=sample_companies,
+        )
+        return
+
+    if strategy == "hyporeflect":
         engine = GraphRAG(
             strategy=strategy,
             indexing_model_id=model_id,

@@ -108,14 +108,12 @@ stop_embed() {
     echo "[Embedding] Stopping (port 18082)..."
     kill_port 18082
     kill_matching_processes "served-model-name embedding-model"
-    kill_matching_processes "backend_embedding"
 }
 
 stop_rerank() {
     echo "[Reranker] Stopping (port 18083)..."
     kill_port 18083
-    kill_matching_processes "backend_reranker"
-    kill_matching_processes "uvicorn third_party\\.backend_reranker\\.main:app"
+    kill_matching_processes "served-model-name reranker-model"
 }
 
 stop_cleanup() {

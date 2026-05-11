@@ -41,10 +41,12 @@ export NEO4J_BIN=/path/to/neo4j
 export NEO4J_CONTAINER_NAME=hyporeflect-neo4j
 
 export OPENAI_API_KEY=...
-export EVAL_MODEL=gpt-5.2
+export EVAL_MODEL=gpt-5.5-2026-04-23
+export REFLECTION_MODEL=gpt-5.4-mini-2026-03-17
+export REFINEMENT_MODEL=gpt-5.4-mini-2026-03-17
 ```
 
-`OPENAI_API_KEY` is only needed if you want judge/evaluation calls to use OpenAI instead of the local served model.
+`OPENAI_API_KEY` is only needed if you want judge/reflection/refinement calls to use OpenAI instead of the local served model. Leave the per-stage `*_MODEL` vars empty for full-local (degrades quality — see CLAUDE.md).
 
 ## Services
 
@@ -199,6 +201,39 @@ Useful options:
 - `--skip-server`: skip service startup checks when services are already running
 
 By default, indexing starts `neo4j`, `gen`, `embed`, and `rerank` unless `--skip-server` is used.
+
+### Baseline indexing (official upstream, routed to local vLLM)
+
+Each baseline now uses **its own published indexing pipeline**, not hyporeflect's
+`GraphRAG` engine. All three share the same LLM (`generation-model` on vLLM
+:28000) and embedding model (`embedding-model` on vLLM :18082) so the
+comparison isolates pipeline architecture, not model choice.
+
+- `naive` — `NaiveRAG` (independent code path under `models/naive/`).
+- `hoprag` — `models/hoprag/official_indexer.py` drives `third_party/HopRAG/HopBuilder.QABuilder`.
+  Stores nodes under Neo4j label `HO_<corpus_tag>` and edges as
+  `HO_<corpus_tag>_p2a`, with corpus-tagged vector + fulltext indices.
+  paddlenlp NER is replaced by spaCy `en_core_web_sm` (POS-filtered content
+  words) — paddlenlp would force a numpy 1.26 downgrade and conflict with
+  graphrag.
+- `ms_graphrag` — `models/ms_graphrag/official_indexer.py` runs `graphrag.api.build_index`
+  (extract_graph → Leiden communities → community reports → embeddings).
+  Outputs parquet under `data/ms_graphrag_output/<corpus_tag>/` plus
+  lancedb vector tables. Query-time adapter (`ms_adapter.py`) reads parquet
+  directly; the upstream MS LocalSearch / GlobalSearch consume the snapshot.
+
+Pre-flight cleanup of stale Neo4j labels/indices and parquet trees from
+older runs:
+
+```bash
+python scripts/cleanup_old_indexings.py            # dry-run (preview)
+python scripts/cleanup_old_indexings.py --apply    # actually drop
+python scripts/cleanup_old_indexings.py --apply --drop-smoke  # also drop *_smoke_*
+```
+
+The script keeps `HY_*` (hyporeflect) and `NA_*` (naive) labels/indices
+untouched; only `HO_*`, `MS_*`, `hoprag_*`, `ms_graphrag_*` namespaces are
+candidates for deletion.
 
 ## Benchmarking
 

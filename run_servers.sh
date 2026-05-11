@@ -269,7 +269,7 @@ start_embed() {
 }
 
 start_rerank() {
-    if curl -s --max-time 1 http://localhost:18083/health > /dev/null 2>&1; then
+    if is_vllm_server_up 18083; then
         echo "✅ Reranker Service is already UP"
         return 0
     fi
@@ -279,16 +279,20 @@ start_rerank() {
         return 0
     fi
 
-    echo "Starting Reranker Service (Port 18083)..."
-    export RERANKER_MODEL_ID="Qwen/Qwen3-Reranker-0.6B"
-    export RERANKER_GPU_ID=1
-    # GPU 1 layout: gen 0.40 + rerank 0.40 = 0.80.
-    # Need enough headroom so KV cache calc stays positive after vllm subtracts
-    # the memory gen already claimed.
-    export RERANKER_GPU_UTIL=0.40
-    export RERANKER_MAX_MODEL_LEN=4096
-    export RERANKER_ATTENTION_BACKEND="FLASHINFER"
-    nohup .venv/bin/uvicorn third_party.backend_reranker.main:app --host 0.0.0.0 --port 18083 > logs/reranker.log 2>&1 &
+    echo "Starting Reranker Service (Port 18083, vllm serve)..."
+    # GPU 1 layout: gen 0.40 + rerank 0.30 = 0.70 (~22.4 GiB / 32 GiB target).
+    # Switched from sync FastAPI wrapper to vllm-serve so AsyncLLMEngine +
+    # continuous batching can fan out concurrent rerank requests across the
+    # GPU instead of serializing them through one Python event loop.
+    CUDA_VISIBLE_DEVICES=1 nohup .venv/bin/vllm serve Qwen/Qwen3-Reranker-0.6B \
+        --served-model-name reranker-model \
+        --host 0.0.0.0 \
+        --port 18083 \
+        --gpu-memory-utilization 0.30 \
+        --max-model-len 4096 \
+        --enable-prefix-caching \
+        --attention-backend FLASHINFER \
+        --trust-remote-code > logs/vllm_reranker.log 2>&1 &
 }
 
 case $SERVICE in

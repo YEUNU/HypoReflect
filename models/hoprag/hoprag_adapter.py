@@ -138,11 +138,17 @@ class HopRAGAdapter:
         self.vllm = VLLMClient(model_name=model_id)
         self.neo4j = Neo4jService()
 
-        self.prefix = "HO_"
+        # Namespace must match models/hoprag/official_indexer.py exactly:
+        # node label = HO_<safe>, edge type = HO_<safe>_p2a, vector index =
+        # HO_<safe>_node_dense_idx. The previous adapter assumed hyporeflect's
+        # GraphRAG-engine schema (HO_<safe>_Chunk + hoprag_<safe>_vector_idx
+        # + NEXT/HOP edges); that's gone now.
         import re as _re
         _safe_corpus = _re.sub(r"[^A-Za-z0-9_]", "_", self.corpus_tag)
-        self.chunk_label = f"{self.prefix}{_safe_corpus}_Chunk"
-        self.vector_index = f"hoprag_{_safe_corpus}_vector_idx"
+        self.prefix = "HO_"
+        self.chunk_label = f"{self.prefix}{_safe_corpus}"
+        self.edge_type = f"{self.prefix}{_safe_corpus}_p2a"
+        self.vector_index = f"{self.prefix}{_safe_corpus}_node_dense_idx"
 
         self._hop_module = self._load_official_hop_module()
         self._configure_official_hop_runtime()
@@ -173,37 +179,38 @@ class HopRAGAdapter:
         neo4j_password = os.environ.get("NEO4J_PASSWORD", "1q2w3e4r")
         neo4j_dbname = os.environ.get("NEO4J_DB", "neo4j")
 
-        retrieve_node_dense_query = f"""
-CALL db.index.vector.queryNodes({{index}}, 80, {{embedding}})
-YIELD node AS dense_node, score AS dense_score
-RETURN {{
-    text: dense_node.text,
-    embed: dense_node.embedding,
-    keywords: [w IN split(toLower(replace(coalesce(dense_node.chunk_summary, dense_node.text), '\\n', ' ')), ' ') WHERE size(w) > 0],
-    id: dense_node.id,
-    title: dense_node.title,
-    sent_id: coalesce(dense_node.sent_id, 0),
-    page: coalesce(dense_node.page, 0),
-    source: dense_node.source
-}} AS dense_node, dense_score
-ORDER BY dense_score DESC
-LIMIT 80
-"""
-        expand_logic_query = f"""
-MATCH (dense_node:{self.chunk_label})-[r:NEXT|HOP]-(logic_node:{self.chunk_label})
-WHERE dense_node.text=$text
-RETURN {{
-    text: logic_node.text,
-    embed: logic_node.embedding,
-    keywords: [w IN split(toLower(replace(coalesce(logic_node.chunk_summary, logic_node.text), '\\n', ' ')), ' ') WHERE size(w) > 0],
-    id: logic_node.id,
-    title: logic_node.title,
-    sent_id: coalesce(logic_node.sent_id, 0),
-    page: coalesce(logic_node.page, 0),
-    source: logic_node.source
-}} AS logic_node
-LIMIT 40
-"""
+        # We DELIBERATELY do NOT override retrieve_node_dense_query or its
+        # sparse/edge variants — config.py's templates already match the
+        # HopRAG-native schema (RETURN node-object, columns text/embed/keywords).
+        # An earlier override returned a Cypher dict literal which collided
+        # with HopRetriever's runtime `.format()` substitution (the dict's
+        # `{text: ...}` got parsed as a `{text}` placeholder, raising
+        # KeyError('\\n    text')).
+        #
+        # We only override the expand/edge-walk queries, which need the
+        # corpus-tagged label + relationship type. Use string concat (not
+        # f-string with `{{ }}`) to avoid format-spec collisions.
+        expand_logic_query = (
+            "MATCH (dense_node:" + self.chunk_label
+            + ")-[r:" + self.edge_type
+            + "]-(logic_node:" + self.chunk_label + ") "
+            "WHERE dense_node.text=$text "
+            "RETURN logic_node"
+        )
+        expand_node_edge_query = (
+            "MATCH (dense_node:" + self.chunk_label
+            + ")-[out_edge:" + self.edge_type
+            + "]-(out_node:" + self.chunk_label + ") "
+            "WHERE dense_node.text=$text "
+            "RETURN out_node, out_edge"
+        )
+        get_out_edge_query = (
+            "MATCH (n:" + self.chunk_label
+            + ")-[r:" + self.edge_type
+            + "]->(m:" + self.chunk_label + ") "
+            "WHERE n.embed=$embed AND n.text=$text "
+            "RETURN r as out_edge, m as out_node"
+        )
 
         def _load_embed_model(_name):
             # Embeddings are served by the project's vLLM embedding endpoint.
@@ -234,6 +241,12 @@ LIMIT 40
             values = [payload.get(k, "") for k in (keys or [])]
             return (*values, messages)
 
+        # All schema-tagged Neo4j index names (sparse + dense, node + edge)
+        # must point at the corpus-tagged indices created by the indexer.
+        sparse_node_index = self.vector_index.replace("_node_dense_idx", "_node_sparse_idx")
+        sparse_edge_index = self.vector_index.replace("_node_dense_idx", "_edge_sparse_idx")
+        dense_edge_index = self.vector_index.replace("_node_dense_idx", "_edge_dense_idx")
+
         patch_targets = [hop_module, tool_module]
         for target in patch_targets:
             target.neo4j_url = neo4j_url
@@ -241,8 +254,12 @@ LIMIT 40
             target.neo4j_password = neo4j_password
             target.neo4j_dbname = neo4j_dbname
             target.node_dense_index_name = self.vector_index
-            target.retrieve_node_dense_query = retrieve_node_dense_query
+            target.node_sparse_index_name = sparse_node_index
+            target.edge_sparse_index_name = sparse_edge_index
+            target.edge_dense_index_name = dense_edge_index
             target.expand_logic_query = expand_logic_query
+            target.expand_node_edge_query = expand_node_edge_query
+            target.get_out_edge_query = get_out_edge_query
             target.load_embed_model = _load_embed_model
             target.get_doc_embeds = _get_doc_embeds
             target.load_language_model = _load_language_model
@@ -277,13 +294,18 @@ LIMIT 40
     async def _lookup_nodes_by_text(self, texts: List[str]) -> List[Dict[str, Any]]:
         if not texts:
             return []
+        # Treat the indexer-backfilled `source` (financebench doc stem) as
+        # the title for inline citations. HopRAG-native nodes have no page
+        # or chunk index, so those stay 0.
         query = f"""
             UNWIND range(0, size($texts) - 1) AS idx
             WITH idx, $texts[idx] AS target_text
             MATCH (n:{self.chunk_label})
             WHERE n.text = target_text
-            RETURN idx, n.id AS id, n.title AS title, n.sent_id AS sent_id,
-                   n.page AS page, n.text AS text, n.embedding AS embedding
+            RETURN idx, id(n) AS id, coalesce(n.source, '') AS title,
+                   0 AS sent_id, 0 AS page,
+                   n.text AS text, n.embed AS embedding,
+                   coalesce(n.source, '') AS source
             ORDER BY idx ASC
         """
         async with self.neo4j.driver.session() as session:
@@ -312,8 +334,10 @@ LIMIT 40
         query_cypher = f"""
             CALL db.index.vector.queryNodes('{self.vector_index}', $k, $embedding)
             YIELD node, score
-            RETURN node.id as id, node.title as title, node.sent_id as sent_id,
-                   node.page as page, node.text as text, node.embedding as embedding, score
+            RETURN id(node) as id, coalesce(node.source, '') as title,
+                   0 as sent_id, 0 as page,
+                   node.text as text, node.embed as embedding,
+                   coalesce(node.source, '') as source, score
         """
         async with self.neo4j.driver.session() as session:
             result = await session.run(  # type: ignore
@@ -396,7 +420,7 @@ Answer:"""
         trace = [{"step": "hoprag_official_hopretriever_qa", "input": messages, "output": answer}]
         sources = [
             {
-                "doc": n.get("title", ""),
+                "doc": n.get("source") or n.get("title", ""),
                 "page": n.get("page", 0),
                 "text": n.get("text", ""),
                 "sent_id": n.get("sent_id", 0),

@@ -18,6 +18,21 @@ class VLLMClient:
     # asyncio guarantees safe int increment without a lock.
     _rr_counter = 0
 
+    # Reranker prompt template state (lazy-loaded once per process).
+    # We send prompts as token IDs to vllm-serve so prefix caching deduplicates
+    # the system+user-prefix and suffix tokens across all rerank calls.
+    _rerank_tokenizer = None
+    _rerank_prefix_ids: Optional[List[int]] = None
+    _rerank_suffix_ids: Optional[List[int]] = None
+    _rerank_yes_id: Optional[int] = None
+    _rerank_no_id: Optional[int] = None
+    _rerank_model_name: str = os.environ.get("RERANK_SERVED_MODEL", "reranker-model")
+    _rerank_max_model_len: int = int(os.environ.get("RERANK_MAX_MODEL_LEN", "4096"))
+    _rerank_default_instruction: str = os.environ.get(
+        "RERANK_DEFAULT_INSTRUCTION",
+        "Given a search query, retrieve relevant passages that answer the query",
+    )
+
     def __init__(self, model_name: Optional[str] = None):
         self.logger = logging.getLogger(__name__)
         self.vllm_url = RAGConfig.VLLM_URL
@@ -426,71 +441,165 @@ class VLLMClient:
                     embeddings.append([])
         return embeddings
 
+    @classmethod
+    def _ensure_rerank_tokenizer(cls) -> None:
+        """Lazy-load the Qwen3-Reranker tokenizer + cache prefix/suffix tokens.
+
+        We build prompts client-side so vllm serve can apply prefix caching to
+        the constant system+user-prefix tokens (~50 tokens shared across every
+        rerank request).
+        """
+        if cls._rerank_tokenizer is not None:
+            return
+        from transformers import AutoTokenizer
+        model_id = os.environ.get("RERANKER_MODEL_ID", "Qwen/Qwen3-Reranker-0.6B")
+        try:
+            tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        except Exception:
+            tok = AutoTokenizer.from_pretrained(model_id)
+        # Same prefix/suffix as the prior backend_reranker; keeping them
+        # identical preserves score parity with the previous service.
+        prefix = (
+            "<|im_start|>system\n"
+            "Judge whether the Document meets the requirements based on the Query "
+            "and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+        )
+        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        cls._rerank_tokenizer = tok
+        cls._rerank_prefix_ids = tok.encode(prefix, add_special_tokens=False)
+        cls._rerank_suffix_ids = tok.encode(suffix, add_special_tokens=False)
+        cls._rerank_yes_id = tok("yes", add_special_tokens=False).input_ids[0]
+        cls._rerank_no_id = tok("no", add_special_tokens=False).input_ids[0]
+
+    def _build_rerank_prompt_ids(self, query: str, doc: str, instruction: str) -> List[int]:
+        tok = type(self)._rerank_tokenizer
+        prefix_ids = type(self)._rerank_prefix_ids
+        suffix_ids = type(self)._rerank_suffix_ids
+        content = (
+            f"<Instruct>: {instruction}\n\n"
+            f"<Query>: {query}\n\n"
+            f"<Document>: {doc}"
+        )
+        content_ids = tok.encode(content, add_special_tokens=False)
+        # max_tokens=1 + small safety margin for sampling overhead.
+        max_content = max(
+            1,
+            type(self)._rerank_max_model_len
+            - len(prefix_ids) - len(suffix_ids) - 1 - 8
+        )
+        if len(content_ids) > max_content:
+            content_ids = content_ids[:max_content]
+        return list(prefix_ids) + list(content_ids) + list(suffix_ids)
+
     async def rerank(self, query: str, documents: List[str], instruction: Optional[str] = None) -> List[float]:
-        """Calls the specialized reranker service."""
-        if not documents: return []
+        """Score (query, doc) pairs via vllm-serve reranker (Qwen3-Reranker-0.6B).
+
+        Each rerank request becomes a batched /v1/completions call where each
+        prompt is `prefix + content + suffix` token IDs. We request top-20
+        logprobs for the single generated token and read the yes/no logprobs to
+        compute `score = exp(yes) / (exp(yes) + exp(no))`. Identical formula
+        and prefix/suffix to the prior sync FastAPI service, so scores are
+        bit-for-bit comparable.
+        """
+        import math
+
+        if not documents:
+            return []
         original_count = len(documents)
         safe_query, safe_documents = self._truncate_for_rerank(query, documents)
+        instruction_str = instruction or type(self)._rerank_default_instruction
         batch_size = max(1, RAGConfig.RERANK_BATCH_SIZE)
+        timeout = None if RAGConfig.LLM_REQUEST_TIMEOUT == 0 else RAGConfig.LLM_REQUEST_TIMEOUT
 
-        def _normalize_scores(raw_scores: Any, expected_count: int) -> List[float]:
-            if not isinstance(raw_scores, list):
-                return [0.0] * expected_count
+        type(self)._ensure_rerank_tokenizer()
+        yes_id = type(self)._rerank_yes_id
+        no_id = type(self)._rerank_no_id
+        yes_str = type(self)._rerank_tokenizer.decode([yes_id])
+        no_str = type(self)._rerank_tokenizer.decode([no_id])
+
+        url = f"{self.rerank_url.rstrip('/')}/completions"
+
+        async def _call_completions(prompts_token_ids: List[List[int]]):
+            payload = {
+                "model": type(self)._rerank_model_name,
+                "prompt": prompts_token_ids,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "logprobs": 20,
+                # vLLM-specific: constrain sampled token to {yes, no}. The
+                # logprobs response still reports top-20 across the full vocab,
+                # which we use to pick out yes/no probabilities.
+                "allowed_token_ids": [yes_id, no_id],
+            }
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                return await client.post(url, json=payload)
+
+        def _scores_from_response(response, expected: int) -> List[float]:
+            try:
+                data = response.json()
+            except Exception:
+                return [0.0] * expected
+            choices = data.get("choices") or []
             scores: List[float] = []
-            for value in raw_scores[:expected_count]:
-                if isinstance(value, (int, float)):
-                    scores.append(float(value))
-                else:
+            for ch in choices:
+                lp = (ch.get("logprobs") or {})
+                top_list = lp.get("top_logprobs") or []
+                top = top_list[0] if top_list else {}
+                # Logprobs come back keyed by decoded token string.
+                yes_lp = top.get(yes_str)
+                no_lp = top.get(no_str)
+                if yes_lp is None and no_lp is None:
                     scores.append(0.0)
-            if len(scores) < expected_count:
-                scores.extend([0.0] * (expected_count - len(scores)))
-            return scores
+                    continue
+                yes_lp = -10.0 if yes_lp is None else yes_lp
+                no_lp = -10.0 if no_lp is None else no_lp
+                ye = math.exp(yes_lp)
+                ne = math.exp(no_lp)
+                denom = ye + ne
+                scores.append(ye / denom if denom > 0 else 0.0)
+            if len(scores) < expected:
+                scores.extend([0.0] * (expected - len(scores)))
+            return scores[:expected]
+
+        async def _score_batch(batch_documents: List[str]) -> List[float]:
+            prompts = [
+                self._build_rerank_prompt_ids(safe_query, d, instruction_str)
+                for d in batch_documents
+            ]
+            response = await self._retry_with_backoff(_call_completions, prompts)
+            if response.status_code == 200:
+                return _scores_from_response(response, len(batch_documents))
+
+            body_preview = response.text[:300] if hasattr(response, "text") else ""
+            self.logger.error("Rerank completions failed: %s - %s", response.status_code, body_preview)
+            if response.status_code >= 500:
+                # Aggressive truncation fallback for context-overflow type errors.
+                _, fallback_docs = self._truncate_for_rerank(
+                    safe_query,
+                    batch_documents,
+                    doc_max_tokens=RAGConfig.RERANK_OVERFLOW_DOC_MAX_TOKENS,
+                )
+                fallback_prompts = [
+                    self._build_rerank_prompt_ids(safe_query, d, instruction_str)
+                    for d in fallback_docs
+                ]
+                fallback_response = await self._retry_with_backoff(_call_completions, fallback_prompts)
+                if fallback_response.status_code == 200:
+                    self.logger.warning(
+                        "Reranker recovered with aggressive truncation (doc_max_tokens=%d).",
+                        RAGConfig.RERANK_OVERFLOW_DOC_MAX_TOKENS,
+                    )
+                    return _scores_from_response(fallback_response, len(batch_documents))
+                self.logger.error(
+                    "Rerank fallback failed: %s - %s",
+                    fallback_response.status_code,
+                    fallback_response.text[:300] if hasattr(fallback_response, "text") else "",
+                )
+            return [0.0] * len(batch_documents)
 
         try:
-            # Base URL is expected to be something like http://localhost:18083/v1
-            url = f"{self.rerank_url.rstrip('/')}/rerank"
-            
-            timeout = None if RAGConfig.LLM_REQUEST_TIMEOUT == 0 else RAGConfig.LLM_REQUEST_TIMEOUT
-            async def _call_rerank(rerank_query: str, rerank_documents: List[str]):
-                payload = {
-                    "query": rerank_query,
-                    "documents": rerank_documents
-                }
-                if instruction:
-                    payload["instruction"] = instruction
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    return await client.post(url, json=payload)
-
-            async def _score_batch(batch_documents: List[str]) -> List[float]:
-                response = await self._retry_with_backoff(_call_rerank, safe_query, batch_documents)
-                if response.status_code == 200:
-                    return _normalize_scores(response.json().get("scores", []), len(batch_documents))
-
-                self.logger.error("Rerank failed: %s - %s", response.status_code, response.text)
-                if response.status_code >= 500:
-                    fallback_query, fallback_documents = self._truncate_for_rerank(
-                        safe_query,
-                        batch_documents,
-                        doc_max_tokens=RAGConfig.RERANK_OVERFLOW_DOC_MAX_TOKENS
-                    )
-                    fallback_response = await self._retry_with_backoff(
-                        _call_rerank,
-                        fallback_query,
-                        fallback_documents
-                    )
-                    if fallback_response.status_code == 200:
-                        self.logger.warning(
-                            "Reranker recovered with aggressive truncation (doc_max_tokens=%d).",
-                            RAGConfig.RERANK_OVERFLOW_DOC_MAX_TOKENS,
-                        )
-                        return _normalize_scores(fallback_response.json().get("scores", []), len(batch_documents))
-                    self.logger.error(
-                        "Rerank fallback failed: %s - %s",
-                        fallback_response.status_code,
-                        fallback_response.text
-                    )
-                return [0.0] * len(batch_documents)
-
             if original_count <= batch_size:
                 return await _score_batch(safe_documents)
 

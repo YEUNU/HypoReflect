@@ -235,3 +235,16 @@ data/enwiki-20171001-pages-meta-current-withlinks-abstracts.tar.bz2
 hyporeflect.pdf
 .claude/
 data/*/
+
+# MS GraphRAG / HopRAG indexer artifacts (parquet + lancedb + pickle caches).
+# Already covered by `data/*/` above, but listing explicitly so it's obvious
+# these large generated trees shouldn't be committed.
+data/ms_graphrag_output/
+data/hoprag_output/
+
+# graphrag library writes its default file_storage here when reporting_config
+# isn't overridden (separate from our explicit output_storage).
+output/
+
+# Local debug / one-off probe scripts under scripts/_test_*.py
+scripts/_test_*.py

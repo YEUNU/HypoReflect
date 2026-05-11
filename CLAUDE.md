@@ -12,11 +12,11 @@ The HypoReflect strategy implements a five-stage pipeline:
 
 `Perception → Planning → Execution → Reflection → Refinement`
 
-- **Perception, Planning, Execution**: local vLLM (Qwen 4B-class), served at `:28000`.
-- **Reflection, Refinement**: `gpt-5.2-2025-12-11` via OpenAI API. The local 4B model degraded judge/refine quality (judge score 0.25 vs 0.34, hallucination 0.36 vs 0.16), so these stages were moved off-vLLM.
-- **LLM-as-judge evaluation**: also `gpt-5.2`, configured by `EVAL_MODEL` and `HALLUCINATION_EVAL_MODEL`.
+- **Perception, Planning, Execution**: local vLLM (Qwen 4B-class), served at `:28000` (and `:28010` if `VLLM_URL_2` is set — round-robin'd by `VLLMClient`).
+- **Reflection, Refinement**: `gpt-5.4-mini-2026-03-17` via OpenAI API by default (`REFLECTION_MODEL` / `REFINEMENT_MODEL` in `.env`). The local 4B model degrades these stages — empirically judge 0.25 / hallucination 0.36 vs 0.34 / 0.16 with GPT — and the new verbatim-claim and recompute-on-claim reflection rules require careful instruction following that the 4B does not deliver. Set those vars to empty if you intentionally want all-local for an ablation.
+- **LLM-as-judge evaluation**: `gpt-5.5-2026-04-23` (`EVAL_MODEL`). The judge produces both correctness score AND hallucination flag in a single combined LLM call (consolidated from two separate calls; `HALLUCINATION_EVAL_MODEL` was removed from `RAGConfig`). The judge also deterministically marks honest "insufficient evidence" abstentions as hallucination=0 even when GT is substantive — the LLM cannot override.
 
-Implication: outages of the local vLLM service do **not** affect Reflection/Refinement, but do affect the upstream stages and indexing.
+Implication: outages of the local vLLM service do **not** affect Reflection/Refinement/Judge, but do affect the upstream stages and indexing.
 
 ## Code layout
 
@@ -33,11 +33,11 @@ The `models/hyporeflect/` tree mirrors the paper's two pipelines (offline §3.1,
   - `graphrag.py` — `GraphRAG` facade composing `IndexingPipeline` (paper §3.1) and `RetrievalPipeline` (paper §3.2.3). The vLLM handle on this class is **`self.llm`** (renamed from `self.vllm` during the 2026-03-30 refactor).
   - `indexing/` — paper §3.1 indexing pipeline:
     - `ocr.py` (§3.1.1 Topology-Preserving OCR runner)
-    - `chunking.py` (§3.1.2 Adaptive Context-Aware Chunking + rolling context)
+    - `chunking.py` (§3.1.2 Adaptive Context-Aware Chunking + rolling context). Adaptive threshold is two-sided clamp around `tau_chunk` (`SIMILARITY_THRESHOLD`); the earlier one-sided `min(...)` form forced one-way drift and never used the configured value.
     - `knowledge_mapping.py` (§3.1.3 Q-/Q+ generation)
-    - `hop_edges.py` (§3.1.4 Rank-Based HOP Edge Pre-Construction)
+    - `hop_edges.py` (§3.1.4 Rank-Based HOP Edge Pre-Construction). Same-company filter is enforced at the Cypher query level (FinanceBench queries are company-anchored — earlier v14 had ~18% cross-company HOPs that added retrieval noise).
     - `graph_writer.py` (Neo4j storage + index lifecycle)
-  - `retrieval/` — paper §3.2.3 query-time retrieval (used by both Execution and the non-agentic baseline): `text_utils.py`, `quality_gates.py`, `rewrite.py`, `hybrid.py` (RRF), `rerank.py` (τ_r), `traversal.py` (NEXT/HOP, offline + runtime), `retrieve.py` (two-stage Q-/Q+ entry).
+  - `retrieval/` — paper §3.2.3 query-time retrieval (used by both Execution and the non-agentic baseline): `text_utils.py`, `quality_gates.py`, `rewrite.py`, `hybrid.py` (RRF), `rerank.py` (τ_r), `traversal.py` (NEXT/HOP, offline + runtime), `retrieve.py` (two-stage Q-/Q+ entry, paper-aligned weights Stage1 Q-=0.7/body=0.3 + Stage2 Q+=0.6/Q-=0.4).
   - `stages/` — one file per pipeline stage:
     - `perception.py` (§3.2.1), `planning.py` (§3.2.2), `reflection.py` (§3.2.4), `refinement.py` (§3.2.5 — also owns the R_max=2 lexicographic-guard loop in `RefinementOrchestrator`).
     - `stages/execution/` — paper §3.2.3 Execution as a sub-package: `handler.py` (base + T_max=6 loop), `planning_state.py`, `search.py`, `evidence.py`, `context.py`, `synthesis.py`, `calculator.py`. The full `ExecutionHandler` is composed in `stages/execution/__init__.py`.
@@ -88,7 +88,20 @@ python main.py --mode benchmark --strategy hyporeflect --queries_file data/finan
 python main.py --mode benchmark_all --sample        # iterates all four strategies
 ```
 
-Sampling: `--sample` means "one company per sector"; `--n K` further trims to the first K sample companies (it's a **company count**, not a query/file count, and it implies `--sample`).
+Per-run env overrides (preferred for one-off ablations — leaves `.env` untouched):
+
+```bash
+# all-local ablation (REFLECTION/REFINEMENT empty)
+REFLECTION_MODEL= REFINEMENT_MODEL= python main.py --mode benchmark --strategy hyporeflect --corpus-tag <tag>
+
+# agentic-OFF baseline (paper §4.4)
+RAG_AGENTIC_MODE=off python main.py --mode benchmark --strategy hyporeflect --corpus-tag <tag> --agentic off
+
+# multi-seed (writes seed_<S>/ subdirs + seeds_aggregate.json with mean ± std + 95% CI)
+RAG_BENCHMARK_SEEDS=0,1,2 python main.py --mode benchmark --strategy hyporeflect --corpus-tag <tag>
+```
+
+Sampling: `--sample` means "one company per sector" (9 companies); `--n K` further trims to the first K sample companies (it's a **company count**, not a query/file count, and it implies `--sample`).
 
 Tests:
 
@@ -115,7 +128,7 @@ Ablations (each toggles one paper-relevant component):
 Benchmark gate (fails the run if metrics fall below thresholds):
 - `RAG_BENCHMARK_GATE`, `RAG_GATE_MAX_LATENCY`, `RAG_GATE_MIN_LLM_JUDGE`, `RAG_GATE_MIN_DOC_MATCH`
 
-OpenAI side: `OPENAI_API_KEY`, `EVAL_MODEL`, `HALLUCINATION_EVAL_MODEL`.
+OpenAI side: `OPENAI_API_KEY`, `EVAL_MODEL`.
 
 ## Result layout
 
@@ -133,3 +146,28 @@ Each result JSON contains averaged metrics, per-query `details`, category breakd
 - Ports are fixed (see Services section); changing them requires updating `run_servers.sh`, `scripts/probe_ports.py`, and any client URLs.
 - Do not introduce new benchmarks; FinanceBench is the only target.
 - Domain-specific post-refinement override builders (operating-margin/segment-drag/quick-ratio/debt-securities/capital-intensity/dividend-stability) were removed during the paper-aligned refactor. Don't reintroduce them — they were FinanceBench-specific patches not in the paper.
+
+## Retrieval/refinement quality fixes (2026-05 sessions)
+
+Several systemic defects were caught by single-company AMD deep-dives and 47-query sample dissection. Future edits should preserve these mechanisms:
+
+- **Reranker top-up fallback** (`retrieval/rerank.py`, `retrieval/traversal.py`): the τ_r gate previously returned only chunks crossing the threshold (often 1 of `top_k`); now tops up to `top_k` with the next-best ungated candidates. Empirical: bootstrap retrieval went from ~1 chunk to 7-12 across queries.
+- **Cross-turn visited dedup** (`AgentState.visited_chunk_ids` in `state.py`): every `graph_search` call accepts `excluded_chunk_ids` and writes back the IDs it returned, so subsequent turns explore fresh territory. NEXT/HOP traversal otherwise re-surfaces the same hub chunks via different seed paths (30-50% duplication observed before the fix; now 0%).
+- **Runtime HOP always-on** (`retrieval/traversal.py`): the runtime Q+ ANN expansion is run unconditionally to complement the offline pre-built HOP edges, recovering answer chunks whose Q+ has no HOP peers above τ_r.
+- **Rerank query simplification** (`GraphRAG._simplified_rerank_query`): the cross-encoder reranker collapses on long verbose queries (verified: same chunk drops 0.94 → 0.03 when wrapped in "Answer as if you are an equity analyst..."). A small LLM call strips role-framing/preludes; cached per user query.
+- **Strict company filter in retrieval** (`retrieval/rerank.py`, `retrieval/traversal.py`): when the query is company-anchored, drop cross-company chunks rather than just demoting them. Falls back to no-filter if strict empties the pool. Company keys are derived from the user query (not from joined LLM-generated entities, which produce compound noise like "incomestatementofoperationsamdfy21").
+- **Reflection structured pre-check** (`utils/prompts/synthesis.py` REFLECTION_PROMPT): forces the model to internally run four checks (A arithmetic+operand identity, B enumeration coverage, C intent alignment, D citation+verbatim+recompute) and emit `checks_performed: [...]` in the JSON output. Without this scaffold the default-PASS rule silently wins. Verbatim-claim and recompute-on-claim rules under D catch fabricated entities/numbers ("Chicago Stock Exchange" type) and operand-selection errors that the calculator cannot self-detect.
+- **Refinement-failure abstain fallback** (`stages/refinement.py` `_unfixable_defect_persists`): when the refinement signature converges and reflection still flags `arithmetic_check=fail`, `operand_slot_mismatch`, `formula_identity_mismatch`, `numeric_compute_answer_mismatch_with_calculator_result`, `fabricated_citation`, or any entity-mismatch critique, the rolled-back wrong answer is overridden with `@@ANSWER: insufficient evidence`. Generic principle: confident-wrong (after self-detection + failed repair) is worse than honest abstain. Trace event: `refinement_force_insufficient`.
+- **Synthesis intent-preservation** (`COMPLEX_AGENT_PROMPT_TEMPLATE` rule 13a/13b): when one required operand is missing but CONTEXT contains grounded narrative for the underlying intent (drivers, qualitative direction), report that grounded narrative instead of abstaining (13a). Paired with explicit "no concept substitution" guard (13b) — answering an adjacent question about a different metric is a hard FAIL.
+- **TOOL_HISTORY mandatory variation** (`AGENT_EXECUTION_SYSTEM_PROMPT` rule 9): the next graph_search MUST include at least one new entity token; period/anchor restate variants on `_mismatch` reject_reasons; abandon-slot after 3 similar failures.
+
+## Cache layout
+
+`data/index_cache/v3/<corpus_tag>/doc__<filehash>__adapt=1-summary=1-table=1-qm=1-qp=1.json` — content-addressed by document SHA8; ablation flags in the filename mean different RAG_ABLATION_* settings produce different cache entries. Same-content document under a different `corpus_tag` is a cache miss by directory namespacing — copy across directories (hardlink works) when intentional. The chunking-algorithm change requires either a fresh corpus_tag or bumping `_CHUNK_CACHE_VERSION` (currently "v3").
+
+## OpenAI cost knobs
+
+- `EVAL_MODEL` — used per-query for the combined judge call (~3-5K input tokens, ~200-500 output).
+- `REFLECTION_MODEL` / `REFINEMENT_MODEL` — fired up to (R_max+1=3) times per query in agentic-on flows; each call ~3-6K input.
+- Empty values fall back to `DEFAULT_MODEL` (local served model name from `VLLM_SERVED_MODEL_NAME`, default `generation-model`).
+- Setting `OPENAI_API_KEY` enables the routing; without it everything stays local.
