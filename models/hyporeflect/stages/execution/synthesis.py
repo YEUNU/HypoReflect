@@ -213,10 +213,20 @@ class ForcedSynthesisSupport:
             return
         forced_started = time.perf_counter()
         answer_type = str(state.query_state.get('answer_type', '')).lower()
-        if answer_type == 'compute' and state.missing_slots:
-            self._run_compute_slot_fill_before_synthesis(state)
-        if answer_type == 'compute' and (not state.missing_slots):
-            self._run_compute_slot_realign_before_synthesis(state)
+        # Deterministic slot fill is gated by RAG_DETERMINISTIC_SLOT_FILL
+        # (default OFF). When OFF, missing slots stay missing — the LLM
+        # ledger owns relevance judgement, and the calculator path simply
+        # does not fire when ledger extraction returned 0 entries (the
+        # previous fallback bound wrong values such as negative current
+        # liabilities from a cash-flow working-capital line). With slots
+        # still missing, synthesis falls through to the LLM-on-context
+        # path, which can answer or abstain honestly.
+        from core.config import RAGConfig
+        if RAGConfig.DETERMINISTIC_SLOT_FILL:
+            if answer_type == 'compute' and state.missing_slots:
+                self._run_compute_slot_fill_before_synthesis(state)
+            if answer_type == 'compute' and (not state.missing_slots):
+                self._run_compute_slot_realign_before_synthesis(state)
         calc, calc_hint = await self._run_compute_calculator_before_synthesis(state=state, answer_type=answer_type)
         if self._apply_compute_direct_answer_before_synthesis(state=state, answer_type=answer_type, calc=calc, forced_started=forced_started):
             return

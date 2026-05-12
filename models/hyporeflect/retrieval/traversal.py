@@ -21,7 +21,16 @@ logger = logging.getLogger(__name__)
 
 
 class TraversalMixin:
-    async def graph_search(self, entities: list[str], depth: int = 2, top_k: int = 5, user_query: str = "", excluded_chunk_ids: Optional[set[str]] = None) -> tuple:
+    async def graph_search(self, entities: list[str], depth: int = 2, top_k: int = 5, user_query: str = "", excluded_chunk_ids: Optional[set[str]] = None, force_expand: bool = False) -> tuple:
+        """Graph-traversal retrieval (paper §3.2.3).
+
+        When `force_expand=True`, every depth hop runs deterministically:
+        the LLM `_need_more_for_next_depth` continuation check is skipped.
+        This is used by the agentic-OFF baseline path so retrieval contains
+        no agentic decision-making (the only LLM calls are the cross-encoder
+        rerank and the query simplification, both of which are graders,
+        not policies).
+        """
         normalized_entities: list[str] = []
         for entity in entities:
             normalized = self._normalize_entity_term(entity)
@@ -161,7 +170,7 @@ class TraversalMixin:
             ):
                 collected[node_id] = node
 
-        if collected:
+        if collected and not force_expand:
             need_more = await _need_more_for_next_depth(list(collected.values()))
             if not need_more:
                 nodes = sorted(
@@ -192,26 +201,26 @@ class TraversalMixin:
                 })
                 candidates = [dict(record) async for record in result]
 
-            # Always augment with runtime HOP (frontier Q+ → Q+ ANN) as a
-            # complement, even in offline HOP_MODE. Pre-built HOP edges are
-            # constructed at indexing time with a tau_r=0.5 cutoff and the
-            # paper's HOP_LINK_LIMIT cap, so high-value answer chunks may
-            # have zero pre-built HOP edges (e.g., specialised cash-flow
-            # reconciliation rows whose Q+ does not pair with any other Q+
-            # above tau_r). Runtime HOP expands the frontier by Q+ vector
-            # similarity at query time, which recovers those isolated
-            # answer chunks. Latency cost is bounded by step_limit.
-            runtime_cands = await self._runtime_hop_candidates(
-                frontier_ids=frontier_ids,
-                visited_ids=visited_ids,
-                step_limit=step_limit,
-            )
-            seen_ids = {str(node.get("id", "")) for node in candidates}
-            for cand in runtime_cands:
-                cand_id = str(cand.get("id", ""))
-                if cand_id and cand_id not in seen_ids:
-                    candidates.append(cand)
-                    seen_ids.add(cand_id)
+            # Runtime HOP supplement: enabled only when HOP_MODE == "runtime".
+            # In offline mode (default), the Cypher pattern above already walks
+            # the pre-built [:HOP] edges from paper §3.1.4 — adding live Q+
+            # ANN on top would double-source HOP candidates and re-introduce
+            # chunks the offline rerank filter (tau_r=0.5, L_hop=5) was
+            # designed to exclude. Prior unconditional invocation here caused
+            # ~3-4 seed chunks per query to be displaced from the final
+            # top_k slice by runtime ANN noise.
+            if RAGConfig.HOP_MODE == "runtime":
+                runtime_cands = await self._runtime_hop_candidates(
+                    frontier_ids=frontier_ids,
+                    visited_ids=visited_ids,
+                    step_limit=step_limit,
+                )
+                seen_ids = {str(node.get("id", "")) for node in candidates}
+                for cand in runtime_cands:
+                    cand_id = str(cand.get("id", ""))
+                    if cand_id and cand_id not in seen_ids:
+                        candidates.append(cand)
+                        seen_ids.add(cand_id)
 
             if not candidates:
                 break
@@ -235,7 +244,7 @@ class TraversalMixin:
                     collected[node_id] = node
 
             frontier_ids = next_frontier[:step_limit]
-            if hop_index < depth - 1 and collected:
+            if hop_index < depth - 1 and collected and not force_expand:
                 need_more = await _need_more_for_next_depth(list(collected.values()))
                 if not need_more:
                     break

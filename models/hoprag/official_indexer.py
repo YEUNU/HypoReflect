@@ -335,7 +335,10 @@ def _patch_hopbuilder_for_pandas2() -> None:
     if getattr(HopBuilder.QABuilder.create_edge, "_patched_for_pandas2", False):
         return
 
-    import inspect, textwrap, pandas as pd
+    import inspect
+    import textwrap
+
+    import pandas as pd
 
     src = inspect.getsource(HopBuilder.QABuilder.create_edge)
     src = textwrap.dedent(src)

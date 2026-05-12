@@ -7,6 +7,8 @@ import re
 import unicodedata
 from typing import Any
 
+from core.config import RAGConfig
+
 
 class TextUtilsMixin:
     @staticmethod
@@ -224,22 +226,28 @@ class TextUtilsMixin:
 
         for year in query_meta.get("years", set()):
             if year in title_lower:
-                boost += 0.25
+                boost += RAGConfig.YEAR_BOOST
                 break
 
         for dtype in query_meta.get("doc_types", set()):
             dtype_key = dtype.replace("-", "")
             if dtype_key in title_lower.replace("-", "").replace("_", ""):
-                boost += 0.15
+                boost += RAGConfig.DOC_TYPE_BOOST
                 break
 
         company_keys = set(query_meta.get("company_keys") or [])
         legacy_key = str(query_meta.get("company_key", "") or "").strip()
         has_company_constraints = bool(company_keys or legacy_key)
         if has_company_constraints and self._node_matches_company(node, query_meta):
-            boost += 0.35
+            boost += RAGConfig.COMPANY_BOOST
 
-        if query_meta.get("financial_intent", False):
+        # Finance-statement-marker boost. Default 0.0 (was 0.15). The prior
+        # value promoted statement-table pages over narrative/MD&A pages that
+        # often hold the verbatim answer; rebalanced via RAG_FINANCE_MARKER_BOOST.
+        if (
+            RAGConfig.FINANCE_MARKER_BOOST
+            and query_meta.get("financial_intent", False)
+        ):
             text_lower = text.lower()
             finance_markers = [
                 "consolidated balance sheets",
@@ -251,7 +259,7 @@ class TextUtilsMixin:
                 "statement of financial position",
             ]
             if any(marker in text_lower for marker in finance_markers):
-                boost += 0.15
+                boost += RAGConfig.FINANCE_MARKER_BOOST
 
         return min(boost, 0.9)
 

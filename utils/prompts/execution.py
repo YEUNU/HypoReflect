@@ -62,22 +62,35 @@ DRAFT_QUERY_STATE: {draft_query_state}
 
 EVIDENCE_LEDGER_PROMPT = """
 Build an evidence ledger from CONTEXT for QUERY_STATE.
-Constraint codes: <<FINANCE_CONSTRAINT_CODES>>.
+
+CONTEXT was already filtered by retrieval+rerank for relevance to QUERY_STATE.
+Your job is to EXTRACT values for each REQUIRED_SLOTS slot, not re-judge
+chunk relevance. When CONTEXT contains a line item that addresses the
+slot's period and entity, emit an entry. Use the slot's `source_anchor`
+to disambiguate when the same label appears in different statements
+(e.g., balance-sheet "Total current liabilities" is a balance, while
+cash-flow "Decrease in current liabilities" is a change — pick the one
+from the slot's source_anchor).
+
 Rules:
-1. Keep only citation-grounded entries from CONTEXT.
-2. Each entry must map to exactly one REQUIRED_SLOTS slot and one citation.
-3. `slot` must be one REQUIRED_SLOTS slot object copied exactly (same entity/period/metric/source_anchor fields).
-4. <<EXTRACTION_CANONICAL_RULES>>
-5. Match slot metric qualifiers strictly (net vs gross, total/consolidated vs segment/product); non-matching variants must be rejected.
-6. For company-level revenue/net-sales slots, keep consolidated primary income-statement totals; reject segment/geography/product values unless explicitly requested.
-7. Reject guidance/forward-looking values for extract/list questions.
-8. Reject placeholders, slot-label echoes, and empty/non-evidence values.
-9. For numeric/ratio slots, accept only values with numeric evidence text; else keep slot missing.
-10. Entity/period mismatch to QUERY_STATE or slot is hard rejection; never map such evidence.
-11. If multiple candidates exist for a slot, select one best-supported value using C1/C2 + exact line-item match + strongest citation support.
-12. Return missing_slots as uncovered REQUIRED_SLOTS slot objects.
-13. Do not mark a slot missing when at least one valid candidate remains after applying hard rejections.
-14. Hard reject entries when citation title/document clearly belongs to another company/entity.
+1. Citation-grounded only. Each entry maps to exactly one REQUIRED_SLOTS
+   slot (copied verbatim from the slot object) and one citation.
+2. <<EXTRACTION_CANONICAL_RULES>>
+3. For numeric slots, `value` must be a number drawn from the cited chunk.
+4. Prefer consolidated primary-statement totals; segment/geography/product
+   breakdowns are acceptable only when the slot explicitly asks for them.
+5. Hard reject only on:
+   - Citation's title/document belongs to a different company than QUERY_STATE.
+   - Value period differs from slot.period.
+   - Value is forward-looking guidance, placeholder, or non-evidentiary.
+6. When multiple candidates exist for one slot, pick the best by
+   source_anchor match, then strongest citation support (paper C1/C2).
+7. Mark a slot missing only when NO grounded candidate remains in
+   CONTEXT after rule 5. Do not abstain on heading-variant uncertainty —
+   the slot's source_anchor + the chunk's statement label resolve it.
+
+Constraint codes: <<FINANCE_CONSTRAINT_CODES>>.
+
 QUERY_STATE: {query_state}
 FILTER_POLICY: {filter_policy}
 CONTEXT: {context}

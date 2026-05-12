@@ -81,7 +81,38 @@ class RAGConfig:
     
     # --- Agent Settings ---
     MAX_AGENT_TURNS = 6
-    MAX_REFINEMENT_ATTEMPTS = int(os.environ.get("RAG_MAX_REFINEMENT", "2"))
+    # R_max from paper §3.2.5. Default 1 (single-shot refinement). Earlier
+    # default 2 ran 4 extra LLM calls per query (1 refinement + 1 reflection
+    # re-judge × 2 iterations) without meaningful J/H lift on local-4B
+    # refinement. Set RAG_MAX_REFINEMENT=2 to restore the paper-aligned loop.
+    MAX_REFINEMENT_ATTEMPTS = int(os.environ.get("RAG_MAX_REFINEMENT", "1"))
+    # When False (default), the refinement loop trusts the refinement output
+    # via structural checks (citation present, @@ANSWER format, not regressing
+    # grounded to insufficient) instead of calling reflection.run again after
+    # each refinement. Saves R_max LLM calls. Restore reflection re-judging
+    # with RAG_REFINEMENT_REJUDGE=true.
+    REFINEMENT_REJUDGE = os.environ.get(
+        "RAG_REFINEMENT_REJUDGE", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Single-call planning (plan + filter_policy in one JSON). Default ON
+    # saves 1 LLM call per query by merging the prior two-pass planning
+    # (plain-text plan + JSON filter_policy). Set RAG_PLANNING_MERGE=false
+    # to restore the two-pass path.
+    PLANNING_MERGE = os.environ.get(
+        "RAG_PLANNING_MERGE", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Inline ledger extraction by the main agent LLM (option D). When True,
+    # the agent LLM emits `EVIDENCE:` lines alongside its tool_call, and the
+    # post-tool `_extract_evidence_entries` LLM call is skipped. Saves 1
+    # LLM call per execution-loop turn (~2-3 calls per query). The parser
+    # is fault-tolerant — partial / malformed JSON does not abort the
+    # turn, only the unparseable lines are dropped. Default OFF until
+    # validated on sample20.
+    AGENT_INLINE_LEDGER = os.environ.get(
+        "RAG_AGENT_INLINE_LEDGER", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     STRICT_CITATION_CHECK = os.environ.get("RAG_STRICT_CITATION", "True").lower() == "true"
     
     # --- OCR & PDF Processing Settings ---
@@ -114,6 +145,52 @@ class RAGConfig:
     QUERY_REWRITE_WEIGHT = float(os.environ.get("RAG_QUERY_REWRITE_WEIGHT", "0.85"))
     BOILERPLATE_PENALTY_WEIGHT = float(os.environ.get("RAG_BOILERPLATE_PENALTY_WEIGHT", "0.25"))
     META_BOOST_WEIGHT = float(os.environ.get("RAG_META_BOOST_WEIGHT", "0.50"))
+    # Per-component boost values inside `_meta_boost_for_node`. Default for
+    # `FINANCE_MARKER_BOOST` is now 0.0 (was 0.15); the prior 0.15 promoted
+    # statement-table pages over narrative/MD&A pages that often contain the
+    # verbatim answer (e.g., 3M MD&A page 41: "net PP&E totaled $8.7B"). Set
+    # `RAG_FINANCE_MARKER_BOOST=0.15` to restore the paper-aligned value.
+    YEAR_BOOST = float(os.environ.get("RAG_YEAR_BOOST", "0.25"))
+    DOC_TYPE_BOOST = float(os.environ.get("RAG_DOC_TYPE_BOOST", "0.15"))
+    COMPANY_BOOST = float(os.environ.get("RAG_COMPANY_BOOST", "0.35"))
+    FINANCE_MARKER_BOOST = float(os.environ.get("RAG_FINANCE_MARKER_BOOST", "0.0"))
+
+    # Agentic-OFF retrieval depth. The previous implementation called only
+    # `retrieve()` (Stage 1+2 RRF + rerank) and ignored the NEXT/HOP graph
+    # edges built during indexing (paper §3.1.4). When >0, agentic-OFF uses
+    # `graph_search` with `force_expand=True` — deterministic graph traversal,
+    # no LLM continuation check. depth=0 restores the legacy behavior for
+    # ablation. depth=1 is the default (1-hop NEXT|HOP + runtime-HOP).
+    AGENTIC_OFF_GRAPH_DEPTH = int(os.environ.get("RAG_AGENTIC_OFF_GRAPH_DEPTH", "1"))
+
+    # Deterministic compute-slot fill before synthesis. When True, missing
+    # slots after the LLM ledger pass are populated by `_deterministic_
+    # compute_slot_entries` (regex/keyword search over chunk text) so the
+    # calculator path can fire. This was the source of operand_mismatch
+    # bugs (e.g., negative `current liabilities` bound from a cash-flow
+    # working-capital change line) — it acts as a relevance re-judge that
+    # the ledger LLM should own. Default OFF so missing slots stay missing
+    # and synthesis falls back to LLM-on-context. Set
+    # `RAG_DETERMINISTIC_SLOT_FILL=true` to restore the legacy behavior.
+    DETERMINISTIC_SLOT_FILL = os.environ.get(
+        "RAG_DETERMINISTIC_SLOT_FILL", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Context atomization+packing LLM passes. When OFF (default), the
+    # execution loop skips `_extract_context_atoms` + `_pack_context_atoms`
+    # (2 LLM calls per ledger refresh) and uses the deterministic
+    # `_build_context_excerpt` directly. Atomization rephrases chunks into
+    # compact evidence atoms and re-judges relevance — a responsibility
+    # the retrieval+ledger layers already own. Disabling cuts ~6-12 LLM
+    # calls per agentic-on query. Restore with `RAG_ENABLE_ATOMIZATION=true`.
+    ENABLE_ATOMIZATION = os.environ.get(
+        "RAG_ENABLE_ATOMIZATION", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Agentic-on execution loop tool-call budget (paper T_max). The dataclass
+    # default is 3 — env override allows ablation (e.g., RAG_MAX_TOOL_CALLS=2
+    # for faster runs, =6 for paper §3.2.3 spec).
+    MAX_TOOL_CALLS = int(os.environ.get("RAG_MAX_TOOL_CALLS", "3"))
 
     # --- Benchmark Gate (Optional Quality Guardrail) ---
     BENCHMARK_GATE_ENABLED = os.environ.get("RAG_BENCHMARK_GATE", "False").lower() == "true"

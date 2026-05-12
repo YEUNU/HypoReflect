@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from models.hyporeflect.graphrag import GraphRAG
 
 @pytest.mark.asyncio

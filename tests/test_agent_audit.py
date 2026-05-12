@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from models.hyporeflect.service import AgentService
 from models.hyporeflect.state import AgentState
 

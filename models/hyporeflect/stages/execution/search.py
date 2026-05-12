@@ -250,7 +250,93 @@ class SearchSupport:
         else:
             loop_state.consecutive_no_progress = 0
 
-    async def _handle_retrieval_tool_call(self, *, state: AgentState, turn: int, tool_call_id: str, routed_tool: str, routed_args: dict[str, Any], loop_state: Any, top_k: int, started: float) -> None:
+    # Regex for inline EVIDENCE lines emitted by the agent LLM alongside its
+    # tool_call. Tolerant of partial output: lines that fail the pattern
+    # are silently skipped.
+    _INLINE_EVIDENCE_RE = re.compile(
+        r'EVIDENCE\s*:\s*'
+        r'value\s*=\s*(?P<value>.+?)\s*\|\s*'
+        r'citation\s*=\s*(?P<citation>\[\[.+?\]\])\s*\|\s*'
+        r'metric\s*=\s*(?P<metric>.+?)\s*(?:$|\n)',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _parse_inline_evidence_pairs(cls, response_text: str) -> list[dict[str, str]]:
+        """Extract EVIDENCE: value=X | citation=Y | metric=Z lines."""
+        if not response_text:
+            return []
+        pairs = []
+        for m in cls._INLINE_EVIDENCE_RE.finditer(response_text):
+            pairs.append({
+                'value': m.group('value').strip(),
+                'citation': m.group('citation').strip(),
+                'metric_hint': m.group('metric').strip(),
+            })
+        return pairs
+
+    @staticmethod
+    def _normalize_for_value_match(text: str) -> str:
+        # Strip commas, dollar signs, whitespace for fuzzy substring match.
+        return re.sub(r'[,$\s]', '', (text or '').lower())
+
+    def _bind_inline_pairs_to_slots(
+        self,
+        pairs: list[dict[str, str]],
+        required_slots: list[Any],
+        context_text: str,
+    ) -> tuple[list[dict[str, str]], dict[str, Any]]:
+        """Deterministic mapping from (value, citation, metric_hint) to a
+        required_slots entry. Returns (entries, diagnostics).
+
+        Binding rules:
+          1. metric_hint must fuzzy-match one slot.metric (substring lowercase).
+          2. value must appear as substring in context_text after
+             normalization (strip commas/$/whitespace).
+          3. citation is preserved verbatim.
+        """
+        accepted: list[dict[str, str]] = []
+        rejected_reasons: dict[str, int] = {}
+        ctx_norm = self._normalize_for_value_match(context_text)
+        for pair in pairs:
+            metric_hint = pair.get('metric_hint', '').lower()
+            value = pair.get('value', '')
+            citation = pair.get('citation', '')
+            if not value or not citation or not metric_hint:
+                rejected_reasons['missing_field'] = rejected_reasons.get('missing_field', 0) + 1
+                continue
+            # Value-in-context check (loose; covers citation-misalignment
+            # without forcing strict per-chunk verification).
+            value_norm = self._normalize_for_value_match(value)
+            if value_norm and value_norm not in ctx_norm:
+                rejected_reasons['value_not_in_context'] = rejected_reasons.get('value_not_in_context', 0) + 1
+                continue
+            # Match to a required slot by metric substring.
+            best_slot = None
+            for slot in required_slots:
+                slot_obj = self._parse_slot_struct(slot) or {}
+                slot_metric = str(slot_obj.get('metric', '') or '').lower()
+                if not slot_metric:
+                    continue
+                if metric_hint in slot_metric or slot_metric in metric_hint:
+                    best_slot = slot_obj
+                    break
+            if not best_slot:
+                rejected_reasons['no_matching_slot'] = rejected_reasons.get('no_matching_slot', 0) + 1
+                continue
+            accepted.append({
+                'slot': best_slot,
+                'value': value,
+                'citation': citation,
+            })
+        return accepted, {
+            'parsed_pairs': len(pairs),
+            'accepted': len(accepted),
+            'rejected_reasons': rejected_reasons,
+            'mode': 'inline',
+        }
+
+    async def _handle_retrieval_tool_call(self, *, state: AgentState, turn: int, tool_call_id: str, routed_tool: str, routed_args: dict[str, Any], loop_state: Any, top_k: int, started: float, agent_response_text: str = '') -> None:
         plan = self._build_tool_search_plan(state=state, routed_tool=routed_tool, routed_args=routed_args, loop_state=loop_state, top_k=top_k)
         txt, data, filter_diag = await self._entity_guarded_graph_search(entities=plan.search_entities, depth=plan.depth, top_k=plan.top_k, query_state=state.query_state, user_query=state.user_query, excluded_chunk_ids=set(state.visited_chunk_ids))
         data_raw_count = int(filter_diag.get('initial_raw', 0) or 0)
@@ -265,8 +351,23 @@ class SearchSupport:
                 state.visited_chunk_ids.add(node_id)
         state.all_context_data.extend(data)
         ledger_context = self._build_context_excerpt(data, query_state=state.query_state)
-        ledger_result = await self._extract_evidence_entries(state.query_state, ledger_context, filter_policy=state.filter_policy)
-        new_entries, model_missing_slots, ledger_debug = self._unpack_evidence_entries_result(ledger_result)
+        # Option D: inline ledger extraction by the main agent LLM.
+        # The agent has already emitted EVIDENCE: lines in its turn-N response
+        # referencing the PRIOR turn's chunks; parse them deterministically
+        # instead of calling _extract_evidence_entries (one extra LLM call
+        # per tool turn). The current turn's NEW chunks (from this very
+        # tool call) will be processed by turn N+1's agent response.
+        if RAGConfig.AGENT_INLINE_LEDGER and agent_response_text:
+            pairs = self._parse_inline_evidence_pairs(agent_response_text)
+            new_entries, ledger_debug = self._bind_inline_pairs_to_slots(
+                pairs,
+                self._required_slots(state.query_state),
+                state.context,
+            )
+            model_missing_slots = None
+        else:
+            ledger_result = await self._extract_evidence_entries(state.query_state, ledger_context, filter_policy=state.filter_policy)
+            new_entries, model_missing_slots, ledger_debug = self._unpack_evidence_entries_result(ledger_result)
         prev_len = len(state.evidence_ledger)
         state.evidence_ledger = self._merge_ledger(state.evidence_ledger, new_entries)
         state.ledger_attempts.append({'step': f'ledger_update_{turn}', 'retrieved': len(data), 'diagnostics': ledger_debug})
@@ -425,6 +526,22 @@ class ToolCallsSupport:
         tool_calls = list(getattr(resp, 'tool_calls', None) or [])
         if not tool_calls:
             return
+        # Extract the agent's natural-language content (for inline EVIDENCE parsing).
+        # Tries common shapes: resp.content / resp.message.content / str(resp).
+        agent_text = ''
+        for getter in (
+            lambda r: getattr(r, 'content', None),
+            lambda r: getattr(getattr(r, 'message', None), 'content', None),
+        ):
+            try:
+                v = getter(resp)
+                if isinstance(v, str) and v.strip():
+                    agent_text = v
+                    break
+            except Exception:
+                pass
+        if not agent_text:
+            agent_text = str(resp)
         remaining_budget = max(loop_state.max_tool_calls - loop_state.tool_calls_used, 0)
         if remaining_budget <= 0:
             append_trace(state.trace, step=f'tool_calls_truncated_{turn}', input={'received_tool_calls': len(tool_calls), 'processed_tool_calls': 0, 'max_tool_calls': loop_state.max_tool_calls, 'tool_calls_used': loop_state.tool_calls_used}, output={'reason': 'tool_call_budget_exhausted'})
@@ -442,7 +559,7 @@ class ToolCallsSupport:
             if routed_tool == 'calculator':
                 await self._handle_calculator_tool_call(state=state, turn=turn, tool_call_id=tool_call_id, routed_args=routed_args, loop_state=loop_state, started=started)
                 continue
-            await self._handle_retrieval_tool_call(state=state, turn=turn, tool_call_id=tool_call_id, routed_tool=routed_tool, routed_args=routed_args, loop_state=loop_state, top_k=top_k, started=started)
+            await self._handle_retrieval_tool_call(state=state, turn=turn, tool_call_id=tool_call_id, routed_tool=routed_tool, routed_args=routed_args, loop_state=loop_state, top_k=top_k, started=started, agent_response_text=agent_text)
         if len(tool_calls_to_process) < len(tool_calls):
             append_trace(state.trace, step=f'tool_calls_truncated_{turn}', input={'received_tool_calls': len(tool_calls), 'processed_tool_calls': len(tool_calls_to_process), 'max_tool_calls': loop_state.max_tool_calls, 'tool_calls_used': loop_state.tool_calls_used}, output={'reason': 'tool_call_budget_exhausted'})
 
@@ -466,5 +583,5 @@ class ToolCallsSupport:
             if routed_tool == 'calculator':
                 await self._handle_calculator_tool_call(state=state, turn=turn, tool_call_id=tool_call_id, routed_args=routed_args, loop_state=loop_state, started=started)
                 continue
-            await self._handle_retrieval_tool_call(state=state, turn=turn, tool_call_id=tool_call_id, routed_tool=routed_tool, routed_args=routed_args, loop_state=loop_state, top_k=top_k, started=started)
+            await self._handle_retrieval_tool_call(state=state, turn=turn, tool_call_id=tool_call_id, routed_tool=routed_tool, routed_args=routed_args, loop_state=loop_state, top_k=top_k, started=started, agent_response_text=response_text)
         return True

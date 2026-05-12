@@ -1,5 +1,3 @@
-import asyncio
-
 import pytest
 from unittest.mock import AsyncMock
 
@@ -111,7 +109,7 @@ async def test_retrieve_expands_with_q_plus_when_stage1_is_insufficient(monkeypa
         "rrf_score": 0.9,
     }
 
-    async def fake_candidates(q_text: str, limit: int, channel: str = "body"):
+    async def fake_candidates(_q_text: str, limit: int, channel: str = "body"):
         if channel == "q_minus":
             return [dict(stage1_node)]
         if channel == "q_plus":

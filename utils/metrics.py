@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 def normalize_answer(s):
     """Normalize answer text for comparison."""
-    if not s: return ""
+    if not s:
+        return ""
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
 
@@ -216,7 +217,11 @@ async def evaluate_financebench_response(
             return None
 
     def _is_insufficient_text(text: Any) -> bool:
-        return "insufficient evidence" in str(text or "").lower()
+        # Matches FinanceBench's 3-way taxonomy: any recognized abstain
+        # phrase (Hypo's "insufficient evidence", HopRAG's "I do not
+        # know", or natural-language refusals) → not hallucination.
+        from utils.abstain import is_abstain
+        return is_abstain(text)
 
     def _heuristic_judge() -> tuple[float, str]:
         fallback_acc = calculate_financebench_accuracy(response, ground_truth)

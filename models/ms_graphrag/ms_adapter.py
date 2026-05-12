@@ -10,7 +10,6 @@ our local vLLM via the existing VLLMClient.
 import importlib
 import logging
 import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np

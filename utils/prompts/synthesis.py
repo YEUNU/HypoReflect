@@ -4,109 +4,112 @@ from .shared import (
 )
 
 
+# Synthesis prompt. CONTEXT is the primary source of truth; EVIDENCE_LEDGER is
+# an advisory hint for compute-operand selection. The prior version (16 rules
+# + 13a/13b/13c sub-rules) over-gated honest answers, so it has been collapsed
+# to one principle-per-rule. Keep this prompt short — the local 4B model
+# follows short rules and ignores long ones.
 COMPLEX_AGENT_PROMPT_TEMPLATE = """
-Answer the query using ONLY the provided context and evidence ledger.
-Constraint codes: <<FINANCE_CONSTRAINT_CODES>>.
+Answer the QUERY using CONTEXT. EVIDENCE_LEDGER is an advisory hint for
+compute operands; it is NOT a gate. If a candidate value for the queried
+fact is present in CONTEXT, answer with it even when EVIDENCE_LEDGER is
+empty or missing that slot.
+
 Rules:
-1. Start with @@ANSWER: and support claims with [[Title, Page X, Chunk Y]] citations from CONTEXT only.
-2. Enforce QUERY_STATE constraints (entity, period, metric, output format).
-3. Extract/list/boolean: answer only from grounded evidence; no guessing.
-4. Compute: use required-slot operands only; cite each operand, show one formula with substituted values, then one final result.
-5. Compute arithmetic protocol: parse numbers exactly from EVIDENCE_LEDGER (remove commas/$/% only), compute once with full precision, then round only at the final step.
-6. If QUERY asks for an average across periods, denominator must explicitly use the average of all required period operands (for example (v1+v2)/2), not a single-period value.
-7. For compute, if multiple candidate values exist in CONTEXT, prioritize values already selected in EVIDENCE_LEDGER.
-7a. If CALCULATOR_RESULT is provided, final numeric answer must exactly match CALCULATOR_RESULT.result.
-8. Never use citations whose company/entity or period conflicts with QUERY_STATE; conflicting citation means invalid answer.
-9. Citation-title company mismatch is a hard conflict; never use such citations in the final answer.
-10. If QUERY_STATE.missing_data_policy is zero_if_not_explicit and required slot remains ungrounded, output @@ANSWER: 0.
-11. If QUERY_STATE.missing_data_policy is inapplicable_explain and context supports metric inapplicability, explain that with citations instead of insufficient evidence.
-12. <<COMPUTE_MISSING_POLICY_LINE>>
-13. For extract/boolean/list queries, required_slots are guidance; if CONTEXT has direct citation-grounded evidence that answers QUERY, answer directly even when some slots remain missing.
-13a. Intent preservation: when the literal compute is blocked because one required operand is missing, BUT CONTEXT contains grounded narrative that addresses the QUERY's underlying intent (drivers, causes, qualitative direction, comparative ranking), answer the underlying intent with citations rather than abstaining. Concretely: a "what drove X change" query should report the cause clauses present in CONTEXT even when the change-magnitude operand is missing; a "is metric Y healthy" query should report the qualitative read present in CONTEXT even when one component of the ratio is missing. Only emit `insufficient evidence` when neither the literal computation nor the underlying intent has any grounded support in CONTEXT.
-13b. No concept substitution: do NOT answer an adjacent question. If QUERY asks segment-by-revenue and CONTEXT only has cash-flow-by-activity, the answer is `insufficient evidence`, not the cash-flow ranking. Intent preservation (13a) only applies when CONTEXT directly addresses the queried subject.
-14. For extract/boolean/list queries, output @@ANSWER: insufficient evidence only when direct evidence is absent or conflicting AND the underlying intent (per 13a) is also ungrounded.
-15. For exact numeric requests, return one exact value (no range/approx unless requested).
-16. Output one final answer only (no meta, no alternatives).
+1. Start the answer with `@@ANSWER:` and cite every factual or numeric claim
+   inline as `[[Title, Page X, Chunk Y]]` using IDs printed in CONTEXT.
+2. Honor QUERY_STATE entity, period, metric, and output format. Never cite
+   a chunk whose company/period conflicts with QUERY_STATE.
+3. Standard line-item synonyms refer to the same number — answer using the
+   value present in CONTEXT regardless of which synonym the question uses:
+     capex ≡ purchases of (additions to) property, plant and equipment
+            from the investing-activities section of the cash flow statement.
+     revenue ≡ net sales ≡ net revenues (top-line income statement).
+     cost of revenue ≡ cost of sales ≡ cost of goods sold.
+     net income ≡ net earnings (bottom-line income statement).
+     operating income ≡ operating profit ≡ income from operations.
+     gross profit ≡ gross margin (dollars).
+   Do NOT bridge unrelated metrics (e.g., operating cash flow ≠ net income).
+4. Compute: parse numbers verbatim from CONTEXT (strip commas/$/%), compute
+   once at full precision, round only at the final step, and show one
+   formula with substituted values then the final result.
+5. Compute averages across periods must use the average of all required
+   period operands, e.g. (v1+v2)/2, not a single-period value.
+6. If CALCULATOR_RESULT is provided, the final numeric value must equal
+   CALCULATOR_RESULT.result exactly.
+7. {compute_missing_policy_line}
+8. {_extraction_zero_policy}
+9. For extract/boolean/list, answer directly from CONTEXT citations. Only
+   emit `@@ANSWER: insufficient evidence` when no chunk in CONTEXT contains
+   a candidate for the queried fact AND no underlying intent (drivers,
+   qualitative direction) is grounded in CONTEXT.
+10. No concept substitution: do not answer an adjacent question. If QUERY
+    asks segment-by-revenue and CONTEXT only contains cash-flow-by-activity,
+    abstain rather than reporting the cash-flow ranking.
+11. For exact numeric requests, return one exact value (no range/approx).
+12. Output one final answer only (no meta, no alternatives).
+
+Constraint codes: {_finance_constraint_codes}.
 
 QUERY_STATE:
-{query_state}
+{{query_state}}
 EVIDENCE_LEDGER:
-{evidence_ledger}
+{{evidence_ledger}}
 
 CONTEXT:
-{context}
-""".replace("<<FINANCE_CONSTRAINT_CODES>>", _FINANCE_CONSTRAINT_CODES).replace(
-    "<<COMPUTE_MISSING_POLICY_LINE>>",
-    _COMPUTE_MISSING_POLICY_LINE,
+{{context}}
+""".format(
+    compute_missing_policy_line=_COMPUTE_MISSING_POLICY_LINE,
+    _extraction_zero_policy=(
+        "If QUERY_STATE.missing_data_policy is `zero_if_not_explicit` and "
+        "the required slot remains ungrounded, output @@ANSWER: 0. "
+        "If `inapplicable_explain` and CONTEXT supports inapplicability, "
+        "explain with citations instead of insufficient evidence."
+    ),
+    _finance_constraint_codes=_FINANCE_CONSTRAINT_CODES,
 )
 
-REFLECTION_PROMPT = """
-Audit the draft answer for accuracy and grounding against QUERY_STATE + EVIDENCE_LEDGER + CONTEXT.
-Constraint codes: <<FINANCE_CONSTRAINT_CODES>>.
 
-Process: BEFORE assigning a verdict, internally run the four checks below
-and record what each produced under `checks_performed` (free-text findings,
-one entry per check). Default to PASS only when every check produced no
-counter-evidence; if any check surfaces a concrete defect cited from
-QUERY_STATE / EVIDENCE_LEDGER / CONTEXT, the verdict is FAIL.
+# Reflection prompt. Audits the draft against CONTEXT + EVIDENCE_LEDGER.
+# The prior version added verbatim-claim / formula-identity exemptions to
+# cover for synthesis's term-equivalence gap; with the synthesis prompt now
+# encoding synonyms (rule 3 above), the exemptions are no longer needed.
+# Reflection's job is narrowed to four checks that do NOT pile up false-FAILs
+# on honest answers.
+REFLECTION_PROMPT = """
+Audit ANSWER against QUERY + CONTEXT + EVIDENCE_LEDGER. Default to PASS
+unless a check below finds a concrete defect cited from QUERY_STATE /
+EVIDENCE_LEDGER / CONTEXT. Record each finding under `checks_performed`
+as a short free-text line.
+
+Honest-abstain rule: if ANSWER is exactly `@@ANSWER: insufficient evidence`,
+PASS when CONTEXT genuinely contains no candidate for the queried fact;
+FAIL with `unnecessary_abstain` when a candidate IS present in CONTEXT.
 
 Checks:
-(A) Arithmetic & operand identity
-    - For compute, recompute from EVIDENCE_LEDGER values; arithmetic must match.
-    - Operand-slot provenance: each numeric operand must come from the
-      EVIDENCE_LEDGER entry whose `slot` tag matches both the operand's
-      metric and period. Wrong-slot reuse (e.g., using one period's value
-      for another period's slot) → `operand_slot_mismatch`.
-    - Operand-magnitude sanity: when the queried metric is a totals/aggregate
-      concept and the chosen operand is conspicuously smaller than another
-      same-metric same-period candidate present in EVIDENCE_LEDGER / CONTEXT
-      primary statement, prefer the primary total → `operand_magnitude_anomaly`.
-    - Formula-identity: when QUERY names a specific ratio/margin/coverage
-      (anything ending in "ratio", "margin", "yield", "turnover", "coverage"),
-      the operand set actually used in ANSWER must be consistent with the
-      standard definition of that named metric. If the operand set matches
-      a different (similarly-named) metric's definition instead, FAIL with
-      `formula_identity_mismatch`.
-(B) Enumeration coverage vs CONTEXT/EVIDENCE_LEDGER
-    - For extract/list/"what drove X" style queries: if EVIDENCE_LEDGER or
-      CONTEXT contains multiple grounded items the answer should report
-      (in the same sentence/list/table), the answer must include all such
-      grounded items. Omitting any → `incomplete_enumeration`. Do NOT fail
-      when the missing items are absent from EVIDENCE_LEDGER/CONTEXT.
-    - Restatement check: for "what drove"/"what caused" queries, an answer
-      that merely restates the metric or its delta without citing any
-      cause/driver clause present in CONTEXT → `restated_metric_no_drivers`.
-(C) Intent alignment
-    - Does the ANSWER address the QUERY's underlying intent, or does it
-      substitute an adjacent concept (e.g., reporting cash-flow-by-activity
-      when QUERY asks segment-by-revenue)? Concept substitution → FAIL.
-    - "Insufficient evidence" with the underlying intent grounded in
-      CONTEXT (drivers, qualitative direction) is also a FAIL — the answer
-      should report the intent-level finding rather than abstain.
-(D) Citation, entity/period, format, verbatim claims
-    - Hard FAIL on cross-company / cross-period citations when same-company
-      / same-period evidence is present.
-    - Hard FAIL on missing/invalid inline citations, multiple competing
-      @@ANSWER prefixes, or required output-format violations.
-    - For exact numeric questions, range/approximate outputs FAIL unless
-      explicitly requested.
-    - "Insufficient evidence" with required slot coverage complete in
-      EVIDENCE_LEDGER → FAIL.
-    - Verbatim-claim check: every named entity, exchange/registrar, place,
-      symbol/ticker, percentage, and dollar figure in the ANSWER must
-      appear verbatim (or as a trivial reformatting — commas, units,
-      parentheses for negatives) in CONTEXT or EVIDENCE_LEDGER. If the
-      ANSWER asserts a specific named fact that does not appear in the
-      cited chunks, FAIL with `fabricated_claim` and identify the absent
-      token. Trivial reformatting allowed; introducing entirely new
-      proper nouns or numeric values is not.
-    - Recompute-on-claim: when the ANSWER reports a numeric result for a
-      compute query, internally recompute from the operand values cited
-      in EVIDENCE_LEDGER for the queried metric's standard formula and
-      compare. If the recomputed value differs from the ANSWER's value
-      by more than the query's requested rounding, FAIL with
-      `arithmetic_check: fail` and include the recomputed value in the
-      issue text so refinement can use it.
+(A) Arithmetic & operand identity (compute queries only).
+    - Recompute from EVIDENCE_LEDGER or CONTEXT values; if the recomputed
+      value differs from the ANSWER's value beyond the requested rounding,
+      FAIL with `arithmetic_check: fail` and include the recomputed value.
+    - Standard line-item synonyms (capex ≡ purchases of PP&E; revenue ≡
+      net sales; cost of revenue ≡ cost of sales; net income ≡ net earnings;
+      operating income ≡ income from operations; gross profit ≡ gross
+      margin in dollars) are NOT operand mismatches.
+(B) Enumeration coverage. For extract/list/"what drove X" queries, the
+    answer must report all grounded items present in CONTEXT for the
+    queried scope. Missing items present in CONTEXT → `incomplete_enumeration`.
+(C) Intent alignment. Concept substitution (answering an adjacent question)
+    → FAIL. Answer that reports the queried subject from CONTEXT, even
+    when using a synonym from check (A), is intent-aligned and PASS.
+(D) Citation & format.
+    - Cross-company or cross-period citations when same-company/same-period
+      evidence is present in CONTEXT → FAIL with `fabricated_citation`.
+    - Missing inline citations, multiple `@@ANSWER:` prefixes, or
+      range/approximate values where the query requested exact → FAIL.
+    - A numeric or named-entity value in ANSWER that does not appear in
+      any cited chunk in CONTEXT → FAIL with `fabricated_claim`. Trivial
+      reformatting (commas, units, parentheses for negatives) and synonym
+      use under check (A) are allowed.
 
 Output JSON only (no prose outside JSON).
 
@@ -136,29 +139,31 @@ PREVIOUS_OUTPUT: {previous_output}
 """
 
 RESPONSE_REFINEMENT_PROMPT = """
-Refine the answer based on the critique.
+Refine the DRAFT answer using CRITIQUE. CONTEXT is the source of truth;
+EVIDENCE_LEDGER is an advisory hint.
+
 Rules:
-1. Output only corrected final answer text in JSON field `final_answer`, and that text must start with @@ANSWER:.
-2. Keep all key claims citation-grounded ([[Title, Page X, Chunk Y]]).
-3. Apply minimal edits and preserve query type/intent (extract/compute/boolean/list).
-4. Keep already-grounded core conclusion unless critique proves it incorrect.
-5. Match query-requested numeric format (unit/precision/rounding).
-6. For compute questions, use only operands explicitly grounded in EVIDENCE_LEDGER/CONTEXT.
-7. For compute, recompute from EVIDENCE_LEDGER values with full precision and round only once at the final step.
-8. <<COMPUTE_MISSING_POLICY_LINE>>
-9. If critique is unclear/conflicting, keep DRAFT unchanged rather than inventing new values.
-10. Do not introduce new numeric values, units, or periods not present in EVIDENCE_LEDGER/CONTEXT.
-11. If DRAFT already matches calculator-derived compute result, preserve that numeric value.
-12. No meta/audit text, no alternatives.
-QUERY: {query}
-QUERY_STATE: {query_state}
-EVIDENCE_LEDGER: {evidence_ledger}
-CONTEXT: {context}
-DRAFT: {draft}
-CRITIQUE: {critique}
-""".replace(
-    "<<COMPUTE_MISSING_POLICY_LINE>>",
-    _COMPUTE_MISSING_POLICY_LINE,
+1. Output JSON with `final_answer` starting with `@@ANSWER:`.
+2. Keep all factual/numeric claims cited inline as `[[Title, Page X, Chunk Y]]`.
+3. Apply minimal edits; preserve query type (extract/compute/boolean/list).
+4. Keep the DRAFT's grounded conclusion unless CRITIQUE proves it incorrect.
+5. Match the requested numeric format (unit, precision, rounding).
+6. Compute: use operands present in EVIDENCE_LEDGER or CONTEXT; recompute
+   at full precision and round only at the final step.
+7. {compute_missing_policy_line}
+8. Do not introduce new numeric values, units, periods, or named entities
+   not present in CONTEXT or EVIDENCE_LEDGER.
+9. If DRAFT already matches a calculator-derived numeric result, preserve it.
+10. No meta or alternatives.
+
+QUERY: {{query}}
+QUERY_STATE: {{query_state}}
+EVIDENCE_LEDGER: {{evidence_ledger}}
+CONTEXT: {{context}}
+DRAFT: {{draft}}
+CRITIQUE: {{critique}}
+""".format(
+    compute_missing_policy_line=_COMPUTE_MISSING_POLICY_LINE,
 )
 
 REFINEMENT_RETRY_PROMPT = """

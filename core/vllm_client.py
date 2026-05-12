@@ -141,7 +141,8 @@ class VLLMClient:
 
     def _truncate_text(self, text: str, max_tokens: int = RAGConfig.MAX_EMBEDDING_LENGTH) -> str:
         """Truncates a single string to fit within max_tokens."""
-        if not text: return ""
+        if not text:
+            return ""
         if self.tokenizer:
             tokens = self.tokenizer.encode(text)
             if len(tokens) <= max_tokens:
@@ -676,7 +677,8 @@ class VLLMClient:
         return any(model.lower().startswith(p) for p in _OPENAI_PREFIXES)
 
     def think_strip(self, message: Optional[str]) -> str:
-        if not message: return ""
+        if not message:
+            return ""
         if "</think>" in message:
             message = message.split("</think>")[-1]
         return message.replace("<end>", "").strip()
@@ -747,9 +749,12 @@ class VLLMClient:
                 params["temperature"] = 0.7
             if RAGConfig.LLM_SEED is not None:
                 params["seed"] = RAGConfig.LLM_SEED
-            if tools: params["tools"] = tools
-            if tool_choice: params["tool_choice"] = tool_choice
-            if kwargs.get("response_format"): params["response_format"] = kwargs["response_format"]
+            if tools:
+                params["tools"] = tools
+            if tool_choice:
+                params["tool_choice"] = tool_choice
+            if kwargs.get("response_format"):
+                params["response_format"] = kwargs["response_format"]
             params["extra_body"] = (
                 kwargs["extra_body"]
                 if "extra_body" in kwargs and kwargs["extra_body"] is not None
@@ -764,7 +769,8 @@ class VLLMClient:
                 _client = self.client
             response = await self._retry_with_backoff(_client.chat.completions.create, **params)
             msg = response.choices[0].message
-            if hasattr(msg, 'tool_calls') and msg.tool_calls: return msg
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                return msg
             
             content = msg.content or (msg.reasoning_content if hasattr(msg, "reasoning_content") else "")
             
@@ -900,7 +906,8 @@ class VLLMClient:
             raise
 
     async def get_embeddings(self, texts: List[str], encoding_type: str = "document") -> List[List[float]]:
-        if not texts: return []
+        if not texts:
+            return []
 
         await self._refresh_embed_server_max_len()
 

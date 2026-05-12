@@ -95,7 +95,12 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _is_insufficient_answer_text(answer: Any) -> bool:
-    return "insufficient evidence" in str(answer or "").lower()
+    # FinanceBench-aligned refusal detection (see utils/abstain.py).
+    # Previously matched only "insufficient evidence" (Hypo-specific),
+    # which left HopRAG / naive natural-language abstains misclassified as
+    # `answer_attempted = 1` and inflated their AttRate.
+    from utils.abstain import is_abstain
+    return is_abstain(answer)
 
 
 def _is_runtime_error_row(item: Dict[str, Any]) -> bool:
@@ -747,7 +752,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     print(f"Generated run reports in: {run_dir}")
     print(f"- {leaderboard_md.name}")
     print(f"- {failures_md.name}")
-    print(f"- run_stage_diagnostics.md")
+    print("- run_stage_diagnostics.md")
     print(f"Global index rows: {len(index_rows)} -> {INDEX_PATH}")
     return 0
 

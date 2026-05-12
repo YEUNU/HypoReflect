@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExpansionLoopState:
     tool_calls_used: int = 0
+    # T_max from paper §3.2.3. Default 3; override via env RAG_MAX_TOOL_CALLS
+    # at the orchestrator construction site (see ExecutionBase.run loop).
     max_tool_calls: int = 3
     consecutive_no_progress: int = 0
 
@@ -114,7 +116,7 @@ class RuntimeSupport:
 
     async def run(self, state: AgentState):
         await self._initialize_query_state_phase(state)
-        loop_state = ExpansionLoopState()
+        loop_state = ExpansionLoopState(max_tool_calls=RAGConfig.MAX_TOOL_CALLS)
         await self._bootstrap_hybrid_search(state, loop_state)
 
         for turn in range(RAGConfig.MAX_AGENT_TURNS):

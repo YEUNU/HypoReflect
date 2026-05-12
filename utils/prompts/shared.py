@@ -12,6 +12,10 @@ _EXTRACTION_CANONICAL_RULES = (
     "preserve accounting notation exactly (e.g., (123), -123, $1,234)."
 )
 
+# Permissive: missing slots block compute only when CONTEXT also has no candidate.
+# Prior wording forced abstain on any missing slot, which over-rejected answers
+# that retrieval did surface but the slot extractor failed to bind.
 _COMPUTE_MISSING_POLICY_LINE = (
-    "For compute, if any required slot remains missing or conflicting, output @@ANSWER: insufficient evidence."
+    "For compute: if a required operand has no candidate in CONTEXT or EVIDENCE_LEDGER, output @@ANSWER: insufficient evidence; "
+    "otherwise use the candidate from CONTEXT even if EVIDENCE_LEDGER did not bind it."
 )

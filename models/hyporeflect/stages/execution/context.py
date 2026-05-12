@@ -783,24 +783,41 @@ class ResidualSupport:
         return empty_result
 
     async def _refresh_context_and_slots(self, state, trace_step: str) -> None:
+        from core.config import RAGConfig
         nodes = self._dedupe_nodes(state.all_context_data, max_nodes=self.context_node_budget)
-        atoms = await self._extract_context_atoms(state.query_state, nodes)
-        packed = await self._pack_context_atoms(state.query_state, atoms, budget_chars=self.context_char_budget)
-        state.evidence_atoms = atoms
-        compressed = str(packed.get('compressed_context', '') or '').strip()
-        fallback_context = self._build_context_excerpt(nodes, limit=8, query_state=state.query_state)
-        use_compressed = bool(compressed)
-        if use_compressed and state.missing_slots and (len(compressed) < 220):
-            use_compressed = False
-        if use_compressed and self._query_has_explicit_statement_anchor(state.user_query) and (len(compressed) < 360):
-            use_compressed = False
-        if use_compressed and state.evidence_ledger:
-            compressed_citations = set(self._context_citation_map(compressed).keys())
-            ledger_citations = {self._normalize_citation(entry.get('citation', '')) for entry in state.evidence_ledger if self._normalize_citation(entry.get('citation', ''))}
-            if ledger_citations and compressed_citations.isdisjoint(ledger_citations):
+        # Atomization+packing skipped when RAG_ENABLE_ATOMIZATION is off
+        # (default). These two LLM passes re-rephrase chunks into compact
+        # atoms and re-select within a budget — duties already covered by
+        # retrieval+rerank (relevance) and ledger extraction (value
+        # binding). Skipping saves ~2 LLM calls per ledger refresh; with
+        # bootstrap + T_max execution turns that's ~6-12 calls per query.
+        if RAGConfig.ENABLE_ATOMIZATION:
+            atoms = await self._extract_context_atoms(state.query_state, nodes)
+            packed = await self._pack_context_atoms(state.query_state, atoms, budget_chars=self.context_char_budget)
+            state.evidence_atoms = atoms
+            compressed = str(packed.get('compressed_context', '') or '').strip()
+            fallback_context = self._build_context_excerpt(nodes, limit=8, query_state=state.query_state)
+            use_compressed = bool(compressed)
+            if use_compressed and state.missing_slots and (len(compressed) < 220):
                 use_compressed = False
-        state.context = compressed if use_compressed else fallback_context
+            if use_compressed and self._query_has_explicit_statement_anchor(state.user_query) and (len(compressed) < 360):
+                use_compressed = False
+            if use_compressed and state.evidence_ledger:
+                compressed_citations = set(self._context_citation_map(compressed).keys())
+                ledger_citations = {self._normalize_citation(entry.get('citation', '')) for entry in state.evidence_ledger if self._normalize_citation(entry.get('citation', ''))}
+                if ledger_citations and compressed_citations.isdisjoint(ledger_citations):
+                    use_compressed = False
+            state.context = compressed if use_compressed else fallback_context
+            model_missing_slots = packed.get('missing_slots', None)
+            atom_count = len(atoms)
+            selected_atom_ids = packed.get('selected_atom_ids', [])
+        else:
+            state.evidence_atoms = []
+            state.context = self._build_context_excerpt(nodes, limit=8, query_state=state.query_state)
+            model_missing_slots = None
+            atom_count = 0
+            selected_atom_ids = []
         if len(state.context) > self.context_char_budget:
             state.context = self._extract_relevant_span(state.context, query_state=state.query_state, max_chars=self.context_char_budget)
-        state.missing_slots = self._resolve_missing_slots(state.query_state, state.evidence_ledger, model_missing_slots=packed.get('missing_slots', None), trust_model_missing=False)
-        append_trace(state.trace, step=trace_step, input={'nodes': len(nodes), 'ledger_entries': len(state.evidence_ledger), 'required_slots': self._required_slots(state.query_state)}, output={'atoms': len(atoms), 'selected_atom_ids': packed.get('selected_atom_ids', []), 'missing_slots': state.missing_slots, 'context_chars': len(state.context)})
+        state.missing_slots = self._resolve_missing_slots(state.query_state, state.evidence_ledger, model_missing_slots=model_missing_slots, trust_model_missing=False)
+        append_trace(state.trace, step=trace_step, input={'nodes': len(nodes), 'ledger_entries': len(state.evidence_ledger), 'required_slots': self._required_slots(state.query_state)}, output={'atoms': atom_count, 'selected_atom_ids': selected_atom_ids, 'missing_slots': state.missing_slots, 'context_chars': len(state.context), 'atomization_enabled': RAGConfig.ENABLE_ATOMIZATION})

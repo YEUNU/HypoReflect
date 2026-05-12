@@ -2,7 +2,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.config import RAGConfig
 from models.hyporeflect.service import AgentService
 from models.hyporeflect.state import AgentState
 from models.hyporeflect.stages.execution import ExecutionHandler, ExpansionLoopState
@@ -173,7 +172,12 @@ async def test_forced_synthesis_prefers_calculator_direct_answer_for_numeric_com
 
 
 @pytest.mark.asyncio
-async def test_forced_synthesis_realigns_collapsed_multi_period_slots_before_calculator():
+async def test_forced_synthesis_realigns_collapsed_multi_period_slots_before_calculator(monkeypatch):
+    # The realign + slot-fill paths are gated by RAG_DETERMINISTIC_SLOT_FILL
+    # (default OFF after 2026-05 fairness fix). Enable for this unit test
+    # which specifically exercises the deterministic compute pre-pass.
+    from core.config import RAGConfig
+    monkeypatch.setattr(RAGConfig, "DETERMINISTIC_SLOT_FILL", True)
     llm = AsyncMock()
     handler = ExecutionHandler(llm=llm, grag=MagicMock())
     handler._compute_with_calculator_from_ledger = AsyncMock(return_value={  # noqa: SLF001

@@ -593,9 +593,14 @@ class EvidenceSupport:
                         continue
                     return False, f"citation not present in context: {citation}"
 
-        if is_compute:
-            if missing_slots:
-                return False, "compute answer requires all slots grounded"
+        # Compute coverage check is now ADVISORY only. Previously this returned
+        # False whenever missing_slots was non-empty, which over-rejected
+        # synthesis-produced answers that did cite the correct value from
+        # CONTEXT but whose slot extractor had failed to bind the operand
+        # into EVIDENCE_LEDGER. We now trust the synthesis output: if a
+        # compute answer cites a valid chunk for an unfilled slot, accept
+        # it and let reflection's arithmetic_check verify the value.
+        if is_compute and evidence_ledger:
             answer_citation_keys = {
                 self._normalize_citation(citation)
                 for citation in citations
@@ -610,6 +615,10 @@ class EvidenceSupport:
             for slot in self._required_slots(query_state):
                 slot_key = self._normalize_slot(slot)
                 slot_citations = slot_to_citations.get(slot_key, set())
+                # When the slot is bound in EVIDENCE_LEDGER, require the
+                # answer to cite at least one of those chunks. When the slot
+                # is unbound (missing), do not gate — CONTEXT-only grounding
+                # is accepted.
                 if slot_citations and answer_citation_keys.isdisjoint(slot_citations):
                     return False, f"missing citation coverage for slot: {slot_key}"
 

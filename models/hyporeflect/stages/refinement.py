@@ -400,8 +400,18 @@ class RefinementOrchestrator:
             await self.refinement.run(state)
 
             after_answer = state.final_answer
-            after_passed = await self.reflection.run(state)
-            after_meta = dict(state.reflection_meta or {})
+            # Reflection re-judge is gated by RAG_REFINEMENT_REJUDGE
+            # (default OFF). When OFF, the loop relies on the structural
+            # non-regression guard inside `_prefer_refined_candidate`
+            # (citation presence, single @@ANSWER prefix, grounded vs
+            # insufficient) instead of calling reflection.run again.
+            # Saves R_max LLM calls per query.
+            if RAGConfig.REFINEMENT_REJUDGE:
+                after_passed = await self.reflection.run(state)
+                after_meta = dict(state.reflection_meta or {})
+            else:
+                after_passed = before_passed  # carry forward; structural guard decides
+                after_meta = dict(before_meta)
 
             keep_refined, quality = self._prefer_refined_candidate(
                 state=state,
@@ -494,10 +504,13 @@ class RefinementOrchestrator:
         return reflection_passed
 
     # ---------- unfixable-defect detection ----------
+    # Narrowed after the synthesis prompt now encodes line-item synonyms:
+    # `operand_slot_mismatch` and `formula_identity_mismatch` previously
+    # fired on synonym-only differences (capex vs purchases of PP&E) and
+    # forced honest answers to be replaced by "insufficient evidence".
+    # Only retain defects that genuinely indicate a wrong number or a
+    # fabricated source.
     _UNFIXABLE_ISSUE_TOKENS: ClassVar[tuple[str, ...]] = (
-        "operand_slot_mismatch",
-        "operand_magnitude_anomaly",
-        "formula_identity_mismatch",
         "numeric_compute_answer_mismatch_with_calculator_result",
         "fabricated_citation",
     )

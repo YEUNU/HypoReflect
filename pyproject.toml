@@ -25,3 +25,11 @@ dependencies = [
     "tqdm",
     "requests",
 ]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# E402: main.py needs sys.path.append before local imports
+# F403: utils/prompts/__init__.py uses wildcard re-export by design
+per-file-ignores = { "main.py" = ["E402"], "utils/prompts/__init__.py" = ["F403"] }

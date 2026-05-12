@@ -94,25 +94,20 @@ class Orchestrator:
     # ---------- non-agentic baseline ----------
     @staticmethod
     def _build_simple_answer_prompt(context: str, user_query: str) -> str:
-        # Agentic-OFF retrieval baseline path (paper §4.4). Single-pass
-        # retrieve-then-answer: only the prompt rules the paper documents
-        # for the baseline are kept here. Anti-abstention,
-        # synonym-equivalence, and assumption-substitution rules that
-        # used to live in this prompt are NOT in the paper baseline and
-        # made the agentic-OFF arm artificially stronger relative to
-        # naive RAG, so they're removed.
+        # Agentic-OFF retrieval baseline (paper §4.4). Identical structure to
+        # the HopRAG / naive baseline prompts so any score gap traces back to
+        # retrieval, not synthesis-prompt asymmetry. The `_ensure_answer_prefix`
+        # wrapper attaches `@@ANSWER:` downstream; doc_match/page_match come
+        # from retrieved nodes, not the answer text.
         return (
-            "Answer the question using ONLY the passages in CONTEXT.\n"
+            "You are a financial analyst. Answer the question using only the provided context.\n"
+            "If the context is insufficient, say you do not know.\n"
             "\n"
-            "Output rules:\n"
-            "1. Begin the answer with `@@ANSWER:` followed by the answer on the same line.\n"
-            "2. Cite every numeric or factual claim inline as `[[Title, Page X, Chunk Y]]` using the exact IDs printed in CONTEXT.\n"
-            "3. For derived metrics, compute from primitive operands present in CONTEXT and show one formula with substituted values, then the final value.\n"
-            "4. If CONTEXT does not contain the evidence needed, output `@@ANSWER: insufficient evidence`.\n"
+            f"Context:\n{context}\n"
             "\n"
-            f"CONTEXT:\n{context}\n"
+            f"Question: {user_query}\n"
             "\n"
-            f"QUESTION: {user_query}\n"
+            "Answer:"
         )
 
     async def _run_non_agentic_workflow(
@@ -122,7 +117,23 @@ class Orchestrator:
     ) -> tuple:
         _ = history
         retrieval_query = self._strip_format_instruction(user_query)
-        context, nodes = await self.grag.retrieve(retrieval_query, top_k=RAGConfig.DEFAULT_TOP_K)
+        graph_depth = RAGConfig.AGENTIC_OFF_GRAPH_DEPTH
+        if graph_depth > 0:
+            # Paper §3.2.3 graph traversal in deterministic mode: no LLM
+            # continuation check (force_expand=True). Activates NEXT/HOP
+            # edges + runtime-HOP that were previously dead weight in
+            # agentic-off (only the agentic-on graph_search tool used them).
+            context, nodes = await self.grag.graph_search(
+                entities=[retrieval_query],
+                depth=graph_depth,
+                top_k=RAGConfig.DEFAULT_TOP_K,
+                user_query=retrieval_query,
+                force_expand=True,
+            )
+        else:
+            # Legacy path (Stage 1+2 RRF + rerank only) — kept for ablation
+            # under RAG_AGENTIC_OFF_GRAPH_DEPTH=0.
+            context, nodes = await self.grag.retrieve(retrieval_query, top_k=RAGConfig.DEFAULT_TOP_K)
         retrieved_nodes = nodes if isinstance(nodes, list) else []
         unique_sources = self._build_unique_sources(retrieved_nodes)
 

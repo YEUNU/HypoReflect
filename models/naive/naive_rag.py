@@ -3,7 +3,7 @@ import hashlib
 import logging
 import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
 from core.neo4j_service import Neo4jService
 from core.vllm_client import VLLMClient
@@ -95,13 +95,15 @@ class NaiveRAG:
             self._index_ready = True
 
         title, sentences = self._parse_document(content)
-        if not sentences: return
+        if not sentences:
+            return
         
         embeddings = await self.vllm.get_embeddings(sentences)
         
         batch_data = []
         for i, (chk, emb) in enumerate(zip(sentences, embeddings)):
-            if not emb: continue
+            if not emb:
+                continue
             # Namespace by corpus + ablation profile to avoid cross-branch collisions in Neo4j.
             chunk_id = hashlib.md5(
                 f"naive|{self.branch_namespace}|{filename}|{title}|{i}".encode()

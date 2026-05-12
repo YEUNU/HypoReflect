@@ -9,7 +9,6 @@ adapter reads these parquet files instead of expecting Neo4j Community nodes.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import shutil

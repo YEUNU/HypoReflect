@@ -259,15 +259,19 @@ async def run_benchmark(
             result_item["benchmark_query"] = query
 
         if is_financebench:
+            from utils.abstain import financebench_label, is_abstain
             answer_text = str(result_item.get("answer", "") or "")
             has_error = bool(result_item.get("error"))
             # Detect abstain on the EXTRACTED final answer (\\boxed{} or
             # 'Final Answer:' marker), NOT on the full reasoning body. Step-by-
             # step CoT often uses 'insufficient evidence' as a logical token
             # while still arriving at a substantive answer; substring matching
-            # the full text mis-classifies those as abstains.
+            # the full text mis-classifies those as abstains. HopRAG-style
+            # natural-language responses without those markers fall through
+            # to the last 300 chars (see `_extract_final_answer`), which
+            # captures HopRAG's "I do not know..." abstain prefix.
             final_answer = _extract_final_answer(answer_text).lower()
-            is_abstain = "insufficient evidence" in final_answer
+            abstained = is_abstain(final_answer)
             judge_score = _safe_float(result_item.get("llm_judge_score", 0.0), 0.0)
             # Judge override: if the LLM judge already scored this as correct,
             # the model clearly produced a usable answer regardless of phrasing.
@@ -276,11 +280,15 @@ async def run_benchmark(
             elif judge_score >= 0.5:
                 answer_attempted = 1.0
             else:
-                answer_attempted = 0.0 if is_abstain else 1.0
+                answer_attempted = 0.0 if abstained else 1.0
             result_item["answer_attempted"] = answer_attempted
             result_item["final_answer_extracted"] = final_answer[:300]
             if not isinstance(result_item.get("hallucination"), (int, float)):
                 result_item["hallucination"] = 1.0 if (answer_attempted > 0.0 and judge_score < 1.0) else 0.0
+            # FinanceBench-style 3-way label baked into each result row
+            # (matches the `label` field in
+            # https://github.com/patronus-ai/financebench/tree/main/results).
+            result_item["financebench_label"] = financebench_label(judge_score, final_answer)
 
         async with write_lock:
             results.append(result_item)
@@ -324,6 +332,25 @@ async def run_benchmark(
                         cat_sum[f"avg_{key}"] = sum(result[key] for result in cat_list) / len(cat_list)
                 cat_summaries[cat] = cat_sum
             summary["category_summaries"] = cat_summaries
+
+            # FinanceBench 3-way taxonomy aggregate (Correct Answer /
+            # Incorrect Answer / Refusal), matching the `label` field used
+            # in the official human-annotated results at
+            # https://github.com/patronus-ai/financebench/tree/main/results.
+            if is_financebench:
+                fb_counts = {"Correct Answer": 0, "Incorrect Answer": 0, "Refusal": 0}
+                for r in results:
+                    label = r.get("financebench_label")
+                    if label in fb_counts:
+                        fb_counts[label] += 1
+                total = len(results) or 1
+                summary["financebench_correct_count"] = fb_counts["Correct Answer"]
+                summary["financebench_incorrect_count"] = fb_counts["Incorrect Answer"]
+                summary["financebench_refusal_count"] = fb_counts["Refusal"]
+                summary["financebench_correct_rate"] = fb_counts["Correct Answer"] / total
+                summary["financebench_incorrect_rate"] = fb_counts["Incorrect Answer"] / total
+                summary["financebench_refusal_rate"] = fb_counts["Refusal"] / total
+
             summary["details"] = results
 
             with open(result_file, "w", encoding="utf-8") as file:
