@@ -48,11 +48,13 @@ The `models/hyporeflect/` tree mirrors the paper's two pipelines (offline §3.1,
 - `models/agentic_core/` — shared agentic orchestrator (`orchestrator.py`, `full_stage_backend.py`) usable by non-hyporeflect strategies via `--agentic on`.
 - `models/{naive,hoprag,ms_graphrag}/` — baseline strategies; each owns its own indexing/retrieval. Selected by `--strategy`/`--model`.
   - `models/ms_graphrag/official_indexer.py` — wraps `graphrag.api.build_index` (Standard pipeline). When `RAG_MS_GEN_API_BASES` lists more than one URL, it installs a `litellm.Router` (`simple-shuffle`) via monkey-patch of `litellm.acompletion`, with a `contextvars.ContextVar` re-entry guard so the Router's own internal calls don't recurse. Outputs parquet under `data/ms_graphrag_output/<corpus_tag>/` + a lancedb vector store. Concurrency capped by `RAG_MS_CONCURRENT_REQUESTS` (default 48).
-  - `models/ms_graphrag/ms_adapter.py` — query-time adapter; reads `community_reports.parquet`, `entities.parquet`, `text_units.parquet` directly. Does **not** require Neo4j Community nodes.
-  - `models/hoprag/official_indexer.py` — drives `third_party/HopRAG/HopBuilder.QABuilder`. paddlenlp NER is stubbed and replaced with spaCy `en_core_web_sm`. Three monkey-patches applied at startup inside `_setup_hoprag_modules`:
+  - `models/ms_graphrag/ms_adapter.py` — query-time adapter using `graphrag.api.local_search` / `graphrag.api.global_search` (graphrag==3.0.1 pip package). Performs true KG-grounded search: entity embedding retrieval via lancedb (`entity_description.lance`) → entity/relationship/community context + text_units → LLM answer. Reads all 6 parquets (`entities`, `communities`, `community_reports`, `text_units`, `relationships`, `documents`). `build_config()` from `official_indexer.py` is reused to construct `GraphRagConfig` pointing at local vLLM + lancedb. `retrieve()` uses ANN+rerank over text_units for the agentic backend path. Does **not** require Neo4j.
+  - `models/hoprag/official_indexer.py` — drives `third_party/HopRAG/HopBuilder.QABuilder`. paddlenlp NER is stubbed and replaced with spaCy `en_core_web_sm`. Four monkey-patches applied at startup inside `_setup_hoprag_modules`:
     1. **Doc-level parallelism** (`_patch_create_nodes_offline_parallel`): replaces the sequential `create_nodes_offline` loop with a `ThreadPoolExecutor(max_workers=RAG_HOP_DOC_WORKERS)` — processes multiple documents concurrently. Inner per-doc chunk parallelism (`RAG_HOP_MAX_THREADS`) is preserved, so total concurrent LLM calls ≈ `DOC_WORKERS × MAX_THREADS`.
     2. **Batched node INSERT** (`_patch_create_nodes_cache_batched`): replaces one-at-a-time `CREATE … RETURN id(n)` with `UNWIND $rows AS row CREATE … RETURN id(n)` in batches of `RAG_HOP_NODE_BATCH` (default 200). Removes the `time.sleep(1)` that fired every 10 docs. Neo4j UNWIND guarantees ID order matches input order; a `len` assertion guards against silent mismatch.
-    3. **Batched edge INSERT** (`_patch_create_edge_batched`): wraps the pandas2-patched `create_edge` — runs it with a `_NullDriver` to populate `self.edges` / `self.abstract2chunk` without touching Neo4j, then inserts both edge types in `UNWIND` batches of `RAG_HOP_EDGE_BATCH` (default 500). numpy int64/float32 arrays are explicitly cast to Python int/list for Bolt serialization.
+    3. **Batched edge INSERT** (`_patch_create_edge_batched`): wraps the pandas2-patched `create_edge` — for small companies (≤ `RAG_HOP_EDGE_CHUNK_THRESHOLD` nodes, default 400) runs with a `_NullDriver` to populate `self.edges` / `self.abstract2chunk`, then inserts in `UNWIND` batches of `RAG_HOP_EDGE_BATCH` (default 500). For large companies (> threshold, e.g. 3M with ~14K nodes), uses `_edges_via_chunked_topk` instead: chunked matmul (chunk size `RAG_HOP_EDGE_CHUNK_SIZE`, default 1000) selects top-`RAG_HOP_EDGE_TOP_K` (default 30) answerable candidates per pending question, avoiding the O(N²) cross-join OOM. Quality is equivalent — top-30 cosine covers the true best match with ~100% probability for financial text.
+    4. **Safe `get_question_list`** (`_safe_get_question_list`): `tool.try_run()` returns `(None, None, None)` on retry exhaustion, but `get_question_list` unpacks only 2 values → `ValueError`. The patch wraps `get_chat_completion` to return `[]` on LLM failure instead of propagating the 3-tuple. Without this, large docs (JPMORGAN_2021_10K, NIKE_2015_10K, WALMART_2021_10K) silently skipped Stage 1 and produced no per-doc pkl.
+  - Stage 2 (`_run_stage2_company_streaming`) inserts nodes + builds edges one company at a time. On resume after OOM/kill, it detects companies already in Neo4j via `n.company` and rebuilds `company_n2q` from per-doc pkl files matched to existing IDs (`ORDER BY id(n)` = insertion order). Progress persisted in `_cache/stage2_nodes_done.pkl` and `_cache/stage2_edges_done.pkl`.
 - `utils/prompts/` — externalized prompt templates (e.g. `RERANKER_INSTRUCTION`); always source prompts from here, do not inline.
 - `tools/benchmark_report.py` — post-processes `data/results/<timestamp>/...` after a benchmark run.
 
@@ -65,7 +67,7 @@ The `models/hyporeflect/` tree mirrors the paper's two pipelines (offline §3.1,
 | HypoReflect Neo4j graph | Docker container `hyporeflect-neo4j` (port 7687) | `./run_index.sh --model hyporeflect --corpus-tag <tag>` |
 | HypoReflect chunk/QA cache | `data/index_cache/v3/<corpus_tag>/` | Same indexing run |
 | HopRAG Neo4j graph | Same container, `HO_<tag>` labels | `./run_index.sh --model hoprag --corpus-tag <tag>` |
-| HopRAG stage-1 cache | `data/hoprag_output/<corpus_tag>/_cache/` | Same — contains `docid2nodes.json` + `node2questiondict.pkl` |
+| HopRAG stage-1 cache | `data/hoprag_output/<corpus_tag>/_cache/` | Same — contains per-doc pkl in `docs/`, `docid2nodes.json`, `node2questiondict.pkl` (always empty — Stage 2 streams per-doc pkls), `stage2_nodes_done.pkl`, `stage2_edges_done.pkl` |
 | MS GraphRAG parquet+lancedb | `data/ms_graphrag_output/<corpus_tag>/` | `./run_index.sh --model ms_graphrag --corpus-tag <tag>` |
 | Naive Neo4j graph | Same container, `NA_<tag>` labels | `./run_index.sh --model naive --corpus-tag <tag>` |
 
@@ -84,7 +86,7 @@ The `models/hyporeflect/` tree mirrors the paper's two pipelines (offline §3.1,
 | `HY_full_v19_hyporeflect_no_summary_` | full_v19_hyporeflect_no_summary | hyporeflect (RAG_ABLATION_SUMMARY) |
 | `HY_full_v19_hyporeflect_no_table_` | full_v19_hyporeflect_no_table | hyporeflect (RAG_ABLATION_TABLE) |
 | `NA_full_v19_naive_T1C1S1_` | full_v19_naive | naive |
-| `HO_full_v19_hoprag` | full_v19_hoprag | hoprag (re-indexing in progress) |
+| `HO_full_v19_hoprag` | full_v19_hoprag | hoprag (Stage 2 running as of 2026-05-14) |
 
 MS GraphRAG: `data/ms_graphrag_output/full_v19_ms_graphrag/` (parquet + lancedb, no Neo4j).
 
@@ -198,6 +200,9 @@ HopRAG indexing knobs (read by `models/hoprag/official_indexer.py`):
 - `RAG_HOP_DOC_WORKERS` (default `4`) — outer doc-level parallelism; total concurrent LLM calls ≈ `DOC_WORKERS × MAX_THREADS`.
 - `RAG_HOP_NODE_BATCH` (default `200`) — UNWIND batch size for node INSERT in Stage 2a (`create_nodes_cache`).
 - `RAG_HOP_EDGE_BATCH` (default `500`) — UNWIND batch size for edge INSERT in Stage 2b (`create_edge`).
+- `RAG_HOP_EDGE_CHUNK_THRESHOLD` (default `400`) — node count above which `_edges_via_chunked_topk` replaces the full cross-join in `create_edge`. Set to 0 to always use chunked path.
+- `RAG_HOP_EDGE_TOP_K` (default `30`) — candidate answerable questions per pending question in the chunked path.
+- `RAG_HOP_EDGE_CHUNK_SIZE` (default `1000`) — pending-question chunk size for the chunked matmul loop.
 
 MS GraphRAG runtime knobs (read by `models/ms_graphrag/official_indexer.py`):
 - `RAG_MS_GEN_API_BASES` — comma-separated vLLM gen URLs (default `28000+28010`). >1 entry triggers the LiteLLM Router monkey-patch.

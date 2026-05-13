@@ -311,6 +311,16 @@ async def run_benchmark(
                 "total_queries": total_queries,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "status": "in_progress" if len(results) < total_queries else "completed",
+                "models": {
+                    "default": RAGConfig.DEFAULT_MODEL,
+                    "embedding": RAGConfig.EMBEDDING_MODEL,
+                    "eval": RAGConfig.EVAL_MODEL,
+                    "perception": RAGConfig.PERCEPTION_MODEL or RAGConfig.DEFAULT_MODEL,
+                    "planning": RAGConfig.PLANNING_MODEL or RAGConfig.DEFAULT_MODEL,
+                    "execution": RAGConfig.EXECUTION_MODEL or RAGConfig.DEFAULT_MODEL,
+                    "reflection": RAGConfig.REFLECTION_MODEL or RAGConfig.DEFAULT_MODEL,
+                    "refinement": RAGConfig.REFINEMENT_MODEL or RAGConfig.DEFAULT_MODEL,
+                },
                 "ablation": {
                     "table_to_text": RAGConfig.ABLATION_TABLE_TO_TEXT,
                     "adaptive_chunking": RAGConfig.ABLATION_ADAPTIVE_CHUNKING,
