@@ -110,6 +110,9 @@ class ExecutionBase:
         self.context_node_budget = 36
         self.context_char_budget = 4200
 
+    def effective_model(self) -> str:
+        return self.stage_model or getattr(self.llm, "model_name", "") or RAGConfig.DEFAULT_MODEL
+
 
 class RuntimeSupport:
     """T_max=6 turn loop entry point (paper §3.2.3)."""
@@ -135,6 +138,7 @@ class RuntimeSupport:
                 input=messages,
                 output=str(resp),
                 duration_ms=(time.perf_counter() - turn_started) * 1000.0,
+                extra={"model": self.effective_model()},
             )
 
             if hasattr(resp, "tool_calls") and resp.tool_calls:

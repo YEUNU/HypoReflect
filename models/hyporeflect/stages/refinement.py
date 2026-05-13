@@ -28,6 +28,7 @@ from models.hyporeflect.stages.common import (
     _ANSWER_PREFIX_RE,
     CITATION_RE,
     extract_final_answer_from_json,
+    format_retrieved_chunks,
     missing_data_policy,
 )
 from models.hyporeflect.stages.llm_json import compact_json, generate_json_with_retries
@@ -46,6 +47,9 @@ class RefinementHandler:
         self.llm = llm
         self.stage_model = stage_model or RAGConfig.REFINEMENT_MODEL
 
+    def effective_model(self) -> str:
+        return self.stage_model or getattr(self.llm, "model_name", "") or RAGConfig.DEFAULT_MODEL
+
     @staticmethod
     def _retry_message(failed_output: Any, reason: str) -> str:
         return REFINEMENT_RETRY_PROMPT.format(
@@ -59,6 +63,9 @@ class RefinementHandler:
             {"role": "user", "content": RESPONSE_REFINEMENT_PROMPT.format(
                 query=state.user_query,
                 context=state.context,
+                retrieved_chunks=format_retrieved_chunks(
+                    getattr(state, "all_context_data", []),
+                ),
                 draft=state.final_answer,
                 critique=state.critique,
                 query_state=compact_json(state.query_state, max_chars=1200),
@@ -112,6 +119,7 @@ class RefinementHandler:
                 "final_answer": state.final_answer,
                 "attempts": attempts,
                 "citation_preserved_from_draft": citation_preserved,
+                "model": self.effective_model(),
             },
             duration_ms=(time.perf_counter() - started) * 1000.0,
         )
@@ -513,6 +521,12 @@ class RefinementOrchestrator:
     _UNFIXABLE_ISSUE_TOKENS: ClassVar[tuple[str, ...]] = (
         "numeric_compute_answer_mismatch_with_calculator_result",
         "fabricated_citation",
+        # A numeric / named-entity value in the ANSWER that the reflection
+        # could not locate verbatim in any cited chunk is a self-detected
+        # ungrounded claim. After refinement signature convergence the
+        # safe-but-honest outcome is `insufficient evidence` rather than
+        # preserving the unverifiable value.
+        "fabricated_claim",
     )
 
     @classmethod

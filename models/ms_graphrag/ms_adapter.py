@@ -186,6 +186,8 @@ class MSGraphRAGAdapter:
         self._community_reports: Optional[pd.DataFrame] = None
         self._entities: Optional[pd.DataFrame] = None
         self._text_units: Optional[pd.DataFrame] = None
+        self._documents: Optional[pd.DataFrame] = None
+        self._doc_id_to_title: Optional[Dict[str, str]] = None
         self._text_unit_embeds: Optional[np.ndarray] = None  # cached corpus embeddings
 
         components = _load_official_ms_components()
@@ -234,6 +236,15 @@ class MSGraphRAGAdapter:
             self._entities = self._read_parquet("entities")
         if self._text_units is None:
             self._text_units = self._read_parquet("text_units")
+        if self._documents is None:
+            self._documents = self._read_parquet("documents")
+            if not self._documents.empty and "id" in self._documents.columns and "title" in self._documents.columns:
+                self._doc_id_to_title = {
+                    str(row["id"]): str(row["title"] or "")
+                    for _, row in self._documents.iterrows()
+                }
+            else:
+                self._doc_id_to_title = {}
 
     # ------------------------------------------------------------------ snapshots
 
@@ -346,14 +357,20 @@ class MSGraphRAGAdapter:
         cand["rerank_score"] = rerank_scores
         cand = cand.sort_values("rerank_score", ascending=False).head(top_k)
 
+        import re as _re
+        doc_map = self._doc_id_to_title or {}
         nodes: List[Dict[str, Any]] = []
         for _, r in cand.iterrows():
+            raw_doc_id = str(r.get("document_id", "") or "")
+            raw_title = doc_map.get(raw_doc_id, raw_doc_id)
+            # Strip file extension for cleaner doc_match against FinanceBench evidence_doc.
+            title = _re.sub(r"\.(pdf|txt|md|json)$", "", raw_title, flags=_re.IGNORECASE)
             nodes.append({
-                "title": str(r.get("document_id", "") or "")[:80],
+                "title": title,
                 "page": 0,
                 "sent_id": int(r.get("human_readable_id", 0) or 0),
                 "text": str(r.get("text", "") or ""),
-                "source": str(r.get("document_id", "") or ""),
+                "source": raw_doc_id,
                 "rerank_score": float(r.get("rerank_score", 0.0) or 0.0),
             })
 

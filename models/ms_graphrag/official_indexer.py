@@ -143,11 +143,29 @@ def _install_litellm_router_for_gen() -> None:
     any other model passes through unchanged.
     """
     global _ROUTER_INSTALLED
-    if _ROUTER_INSTALLED or len(_GEN_API_BASES) <= 1:
+    if _ROUTER_INSTALLED:
         return
     import contextvars
+    import urllib.request
     import litellm
     from litellm import Router
+
+    # Only route to servers that are actually UP right now.
+    live_bases = []
+    for base in _GEN_API_BASES:
+        health_url = base.rstrip("/").removesuffix("v1").rstrip("/") + "/health"
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            live_bases.append(base)
+        except Exception:
+            logger.warning("MS GraphRAG: gen endpoint unreachable, skipping: %s", base)
+    if not live_bases:
+        logger.warning("MS GraphRAG: no live gen endpoints; falling back to all configured")
+        live_bases = list(_GEN_API_BASES)
+    logger.info("MS GraphRAG: live gen endpoints for router: %s", live_bases)
+
+    if len(live_bases) <= 1:
+        return
 
     target = f"openai/{_GEN_MODEL_NAME}"
     model_list = [
@@ -159,7 +177,7 @@ def _install_litellm_router_for_gen() -> None:
                 "api_key": "EMPTY",
             },
         }
-        for ab in _GEN_API_BASES
+        for ab in live_bases
     ]
     router = Router(model_list=model_list, routing_strategy="simple-shuffle")
 

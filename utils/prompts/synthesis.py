@@ -106,17 +106,34 @@ Checks:
       evidence is present in CONTEXT → FAIL with `fabricated_citation`.
     - Missing inline citations, multiple `@@ANSWER:` prefixes, or
       range/approximate values where the query requested exact → FAIL.
-    - A numeric or named-entity value in ANSWER that does not appear in
-      any cited chunk in CONTEXT → FAIL with `fabricated_claim`. Trivial
-      reformatting (commas, units, parentheses for negatives) and synonym
-      use under check (A) are allowed.
+    - Verbatim-value check: for each numeric value AND each named-entity
+      value asserted as a fact in ANSWER (not the final computed result of
+      a compute query), the value must appear in the text of at least one
+      chunk cited in ANSWER. Normalize before matching: strip `$`, commas,
+      surrounding whitespace, and unit suffixes ("million"/"billion"/"%");
+      `$41,990 million` matches `41990` or `41,990` or `41,990.0`. If the
+      asserted value is NOT located after normalization, FAIL with
+      `fabricated_claim` and list the value + the cited chunk in `issues`.
+    - For compute queries: the final computed result is exempt from the
+      verbatim-value check (it is derived), but each OPERAND value the
+      ANSWER reports as input to the calculation MUST pass the verbatim
+      check against its citation.
 
 Output JSON only (no prose outside JSON).
+
+RETRIEVED_CHUNKS is a strict superset of CONTEXT: it contains every
+chunk the retrieval stage surfaced for this query, including ones the
+execution agent did not lift into CONTEXT. Use it as the authoritative
+source when check (D)'s verbatim-value rule looks for an asserted value,
+when check (B)'s enumeration check looks for missed list items, and when
+deciding `unnecessary_abstain`. If a defect can be substantiated only by
+RETRIEVED_CHUNKS (not by CONTEXT), still emit it.
 
 QUERY: {query}
 QUERY_STATE: {query_state}
 EVIDENCE_LEDGER: {evidence_ledger}
 CONTEXT: {context}
+RETRIEVED_CHUNKS: {retrieved_chunks}
 ANSWER: {draft_answer}
 """.replace("<<FINANCE_CONSTRAINT_CODES>>", _FINANCE_CONSTRAINT_CODES)
 
@@ -156,10 +173,17 @@ Rules:
 9. If DRAFT already matches a calculator-derived numeric result, preserve it.
 10. No meta or alternatives.
 
+RETRIEVED_CHUNKS is the full retrieval pool (a superset of CONTEXT).
+When CRITIQUE asserts the DRAFT cited a wrong line item or missed a
+required item, scan RETRIEVED_CHUNKS for a same-company / same-period
+chunk that contains the correct value, and refine the answer using
+that chunk. Cite the chunk you actually used.
+
 QUERY: {{query}}
 QUERY_STATE: {{query_state}}
 EVIDENCE_LEDGER: {{evidence_ledger}}
 CONTEXT: {{context}}
+RETRIEVED_CHUNKS: {{retrieved_chunks}}
 DRAFT: {{draft}}
 CRITIQUE: {{critique}}
 """.format(

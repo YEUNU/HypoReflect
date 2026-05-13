@@ -27,6 +27,9 @@ class PlanningHandler:
         self.llm = llm
         self.stage_model = stage_model or RAGConfig.PLANNING_MODEL
 
+    def effective_model(self) -> str:
+        return self.stage_model or getattr(self.llm, "model_name", "") or RAGConfig.DEFAULT_MODEL
+
     @staticmethod
     def _planning_prompt() -> str:
         return PLANNING_PROMPT
@@ -176,6 +179,7 @@ class PlanningHandler:
                     "accepted": ok,
                     "attempts": attempts,
                     "mode": "merged",
+                    "model": self.effective_model(),
                 },
                 duration_ms=(time.perf_counter() - started) * 1000.0,
             )
@@ -192,7 +196,7 @@ class PlanningHandler:
             state.trace,
             step="planning",
             input=messages,
-            output=state.plan,
+            output={"plan": state.plan, "model": self.effective_model(), "mode": "two_pass_plan"},
             duration_ms=(time.perf_counter() - plan_started) * 1000.0,
         )
         policy_messages = [
@@ -222,6 +226,7 @@ class PlanningHandler:
                 "filter_policy": state.filter_policy,
                 "accepted": ok,
                 "attempts": attempts,
+                "model": self.effective_model(),
             },
             duration_ms=(time.perf_counter() - filter_started) * 1000.0,
         )

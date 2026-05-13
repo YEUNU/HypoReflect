@@ -85,6 +85,50 @@ def extract_first_number(text: str) -> float | None:
         return None
 
 
+def format_retrieved_chunks(
+    nodes: Any,
+    *,
+    max_chunks: int = 12,
+    per_chunk_chars: int = 380,
+    total_chars: int = 4500,
+) -> str:
+    """Render the full retrieval pool for reflection/refinement prompts.
+
+    Dedupes by (title, page, sent_id), caps each chunk's text, then enforces
+    a total character budget. Empty / non-list input renders as the literal
+    string `"none"` so the prompt placeholder is never blank.
+    """
+    if not isinstance(nodes, list) or not nodes:
+        return "none"
+    seen: set[tuple[str, Any, Any]] = set()
+    lines: list[str] = []
+    total = 0
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        title = str(node.get("title") or node.get("doc") or "Unknown").strip()
+        page = node.get("page", 0)
+        sent_id = node.get("sent_id", 0)
+        key = (title, page, sent_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        text = re.sub(r"\s+", " ", str(node.get("text", "") or "")).strip()
+        if not text:
+            continue
+        snippet = text[:per_chunk_chars]
+        if len(text) > per_chunk_chars:
+            snippet = snippet.rstrip() + "…"
+        line = f"[[{title}, Page {page}, Chunk {sent_id}]] {snippet}"
+        if total + len(line) + 1 > total_chars and lines:
+            break
+        lines.append(line)
+        total += len(line) + 1
+        if len(lines) >= max_chunks:
+            break
+    return "\n".join(lines) if lines else "none"
+
+
 def answer_matches_calc_result(answer: str, calc_result: str) -> bool:
     """Check whether the calculator result is faithfully reflected in the
     answer text. Used by both the reflection arithmetic-check pass and the

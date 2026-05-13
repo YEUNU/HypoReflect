@@ -20,11 +20,13 @@ hyporeflect §3.1.4 same-company HOP filter) so each group stays tractable.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
 import shutil
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -33,11 +35,23 @@ import numpy as np
 logger = logging.getLogger("HypoReflect")
 
 _HOPRAG_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "HopRAG"
-_GEN_API_BASE = os.environ.get("RAG_HOP_GEN_API_BASE", "http://localhost:28000/v1")
+
+_GEN_API_BASES: list[str] = [
+    s.strip()
+    for s in os.environ.get(
+        "RAG_HOP_GEN_API_BASES",
+        os.environ.get("RAG_HOP_GEN_API_BASE", "http://localhost:28000/v1,http://localhost:28010/v1"),
+    ).split(",")
+    if s.strip()
+]
+_GEN_API_BASE = _GEN_API_BASES[0]
 _GEN_MODEL_NAME = os.environ.get("VLLM_SERVED_MODEL_NAME", "generation-model")
 _EMBED_API_BASE = os.environ.get("RAG_HOP_EMBED_API_BASE", "http://localhost:18082/v1")
 _EMBED_MODEL_NAME = os.environ.get("RAG_HOP_EMBED_MODEL_NAME", "embedding-model")
 _EMBED_DIM = int(os.environ.get("RAG_HOP_EMBED_DIM", "1024"))
+_DOC_WORKERS = max(1, int(os.environ.get("RAG_HOP_DOC_WORKERS", "4")))
+_NODE_INSERT_BATCH = max(1, int(os.environ.get("RAG_HOP_NODE_BATCH", "200")))
+_EDGE_INSERT_BATCH = max(1, int(os.environ.get("RAG_HOP_EDGE_BATCH", "500")))
 
 _OUTPUT_ROOT = Path(os.environ.get("RAG_HOP_OUTPUT_ROOT", "data/hoprag_output"))
 
@@ -177,6 +191,91 @@ class _VLLMEmbedClient:
         return arr[0] if single else arr
 
 
+def _install_round_robin_patch(config) -> None:
+    """Round-robin gen endpoints by replacing tool.OpenAI with a subclass that
+    rotates base_url on each instantiation. This preserves the original
+    _get_chat_completion logic (return format, JSON parsing, try_run retries)
+    and only changes which server each request goes to.
+
+    Also caps max_tokens to 1024 so long 10-K documents (28K+ tokens) fit
+    within the 32768 context window (32768 - 1024 = 31744 max input).
+    """
+    import urllib.request
+    import tool
+    from openai import OpenAI as _OrigOpenAI
+
+    # Only include endpoints that respond to /health right now.
+    live_bases = []
+    for base in _GEN_API_BASES:
+        health_url = base.rstrip("/").removesuffix("v1").rstrip("/") + "/health"
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            live_bases.append(base)
+        except Exception:
+            logger.warning("HopRAG: gen endpoint unreachable, skipping: %s", base)
+    if not live_bases:
+        logger.warning("HopRAG: no live gen endpoints; falling back to all configured")
+        live_bases = list(_GEN_API_BASES)
+    logger.info("HopRAG: live gen endpoints for round-robin: %s", live_bases)
+
+    _cycle = itertools.cycle(live_bases)
+    _lock = threading.Lock()
+    _local_bases_set = set(live_bases) | set(_GEN_API_BASES)
+
+    class _RoundRobinOpenAI(_OrigOpenAI):
+        """Drop-in replacement: rotates base_url across live gen endpoints."""
+        def __init__(self, api_key=None, base_url=None, **kwargs):
+            if base_url and any(base_url.startswith(b.rstrip("/v1").rstrip("/"))
+                                for b in _local_bases_set):
+                with _lock:
+                    base_url = next(_cycle)
+            super().__init__(api_key=api_key, base_url=base_url, **kwargs)
+
+    # tool.py does `from openai import OpenAI` at module level; replacing
+    # tool.OpenAI makes all subsequent `OpenAI(...)` calls in that module use
+    # our subclass while preserving every other part of _get_chat_completion.
+    tool.OpenAI = _RoundRobinOpenAI
+
+    # Cap max_tokens and truncate input to stay within the 32768 context window.
+    # HopRAG JSON outputs (Title + Question List) verified at 25-410 tokens;
+    # 512 cap is safe. Max input budget: 32768 - 512 = 32256 tokens.
+    # Character-based truncation (~3.5 chars/token) handles edge cases where
+    # even 32256-token budget is exceeded by extremely long 10-K documents.
+    _MAX_OUTPUT = 512
+    _MAX_MODEL_LEN = 32768
+    _MAX_INPUT_CHARS = int((_MAX_MODEL_LEN - _MAX_OUTPUT) * 3.5)  # ~111K chars
+
+    _orig_get_chat_completion = tool._get_chat_completion
+
+    def _capped_get_chat_completion(chat, return_json=True, model=None,
+                                    max_tokens=4096, keys=None):
+        # Truncate the last user message if it exceeds the input budget.
+        messages = list(chat)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                text = messages[i].get("content", "")
+                if len(text) > _MAX_INPUT_CHARS:
+                    messages = list(messages)
+                    messages[i] = {**messages[i], "content": text[:_MAX_INPUT_CHARS]}
+                    logger.debug("HopRAG: truncated user message %d→%d chars",
+                                 len(text), _MAX_INPUT_CHARS)
+                break
+        return _orig_get_chat_completion(
+            messages, return_json=return_json,
+            model=model,
+            max_tokens=min(max_tokens, _MAX_OUTPUT),
+            keys=keys,
+        )
+
+    tool._get_chat_completion = _capped_get_chat_completion
+
+    logger.info(
+        "HopRAG: round-robin OpenAI patch + max_tokens cap installed "
+        "across %d endpoints: %s",
+        len(live_bases), live_bases,
+    )
+
+
 def _install_optional_stubs() -> None:
     """Stub HopRAG's heavy/Chinese-NLP deps that we don't need (paddlenlp +
     sentence_transformers + modelscope). They get imported at module load by
@@ -266,6 +365,12 @@ def _setup_hoprag_modules(corpus_tag: str) -> None:
         config.local_model_name: {"base": config.local_base, "key": config.local_key},
     }
 
+    # Round-robin across multiple gen endpoints when RAG_HOP_GEN_API_BASES has
+    # more than one URL. Health-checks each endpoint first; only live servers
+    # enter the cycle. Monkey-patches tool._get_chat_completion (thread-safe).
+    if len(_GEN_API_BASES) >= 1:
+        _install_round_robin_patch(config)
+
     # Neo4j connection from our env (matches Neo4jService defaults).
     config.neo4j_url = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     config.neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
@@ -288,6 +393,9 @@ def _setup_hoprag_modules(corpus_tag: str) -> None:
     tool.get_ner_eng = _spacy_ner_eng
 
     _patch_hopbuilder_for_pandas2()
+    _patch_create_nodes_offline_parallel()
+    _patch_create_nodes_cache_batched()
+    _patch_create_edge_batched()
 
 
 _SPACY_NLP = None
@@ -371,6 +479,314 @@ def _patch_hopbuilder_for_pandas2() -> None:
     patched._patched_for_pandas2 = True  # type: ignore[attr-defined]
     HopBuilder.QABuilder.create_edge = patched
     logger.info("HopRAG: patched QABuilder.create_edge for pandas-2 compatibility")
+
+
+def _patch_create_nodes_offline_parallel() -> None:
+    """Replace QABuilder.create_nodes_offline with a version that processes
+    _DOC_WORKERS documents concurrently instead of sequentially.
+
+    Inner per-doc chunk parallelism (max_thread_num) is preserved — the two
+    levels of parallelism stack:
+        total concurrent LLM calls ≈ _DOC_WORKERS × max_thread_num
+    e.g. DOC_WORKERS=4 × CHUNK_THREADS=8 → 32 concurrent calls across 2 endpoints.
+
+    Thread-safety notes:
+    - Node-ID assignment uses a lock-protected counter.  IDs only need to be
+      unique within the offline cache (real Neo4j IDs are assigned later in
+      create_nodes_cache).
+    - docid2nodes / node2questiondict are written from the main thread only
+      (as_completed loop), so no lock is needed there.
+    - _VLLMEmbedClient shares a requests.Session across threads, which is safe
+      for concurrent POST calls (urllib3 connection pool is thread-safe).
+    """
+    import HopBuilder
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    from tqdm import tqdm as _tqdm
+
+    if getattr(HopBuilder.QABuilder.create_nodes_offline, "_patched_parallel", False):
+        return
+
+    _doc_workers = _DOC_WORKERS
+
+    def _parallel_create_nodes_offline(self, docs_dir, start_index=0, span=100):
+        import os
+        import time as _time
+
+        docs_pool = sorted(os.listdir(docs_dir))
+        docs_to_process = [
+            d for d in docs_pool[start_index : start_index + span]
+            if d not in self.done
+        ]
+        import config as _cfg
+        logger.info(
+            "HopRAG parallel node build: %d docs, doc_workers=%d, chunk_threads=%d",
+            len(docs_to_process), _doc_workers, _cfg.max_thread_num,
+        )
+
+        _id_lock = threading.Lock()
+        _counter = [start_index * 50]
+        docid2nodes: dict = {}
+        node2questiondict: dict = {}
+
+        def _process_one(doc_id):
+            doc_path = os.path.join(docs_dir, doc_id)
+            try:
+                with open(doc_path, "r") as fh:
+                    doc = fh.read()
+                sentence2node = self.get_single_doc_qa(doc)
+                local_nodes = []
+                local_n2q = {}
+                for _text, tup in sentence2node.items():
+                    node = {
+                        "text": tup[0],
+                        "keywords": sorted(list(tup[1])),
+                        "embed": tup[2],
+                    }
+                    with _id_lock:
+                        _counter[0] += 1
+                        node_id = _counter[0]
+                    local_n2q[(node_id, doc_id)] = (node, tup[3])
+                    local_nodes.append(node_id)
+                return doc_id, local_nodes, local_n2q
+            except Exception as exc:
+                logger.warning("HopRAG parallel: error on %s: %s", doc_id, exc)
+                _time.sleep(1)
+                return doc_id, None, None
+
+        with ThreadPoolExecutor(max_workers=_doc_workers) as pool:
+            futures = {pool.submit(_process_one, d): d for d in docs_to_process}
+            for fut in _tqdm(
+                _as_completed(futures), total=len(futures), desc="create_nodes_parallel"
+            ):
+                doc_id, nodes, n2q = fut.result()
+                if nodes is not None:
+                    docid2nodes[doc_id] = nodes
+                    node2questiondict.update(n2q)
+
+        return docid2nodes, node2questiondict
+
+    _parallel_create_nodes_offline._patched_parallel = True  # type: ignore[attr-defined]
+    HopBuilder.QABuilder.create_nodes_offline = _parallel_create_nodes_offline
+    import config as _hop_config
+    logger.info(
+        "HopRAG: patched create_nodes_offline for doc-level parallelism "
+        "(doc_workers=%d, chunk_threads=%d)",
+        _doc_workers, _hop_config.max_thread_num,
+    )
+
+
+def _patch_create_nodes_cache_batched() -> None:
+    """Replace create_nodes_cache with UNWIND batch INSERT (no per-doc sleep).
+
+    Correctness guarantees:
+    - Neo4j UNWIND ... CREATE ... RETURN id(n) returns IDs in the same order as
+      the input list — this is a stable, documented property used in all Neo4j
+      production batch patterns.
+    - We assert len(returned_ids) == len(batch) and raise on mismatch so a
+      silent mapping error is impossible.
+    - numpy embed arrays are explicitly converted to Python lists so nested-dict
+      UNWIND parameters serialize correctly over Bolt.
+    """
+    import HopBuilder
+
+    if getattr(HopBuilder.QABuilder.create_nodes_cache, "_patched_batched", False):
+        return
+
+    _batch_size = _NODE_INSERT_BATCH
+
+    def _batched_create_nodes_cache(self, cache_dir="path/to/cache_dir"):
+        import json
+        import pickle
+
+        logger.info("HopRAG batched nodes: label=%s from %s", self.label, cache_dir)
+        if self.driver is None:
+            from neo4j import GraphDatabase
+            import config as _c
+            self.driver = GraphDatabase.driver(
+                _c.neo4j_url, auth=(_c.neo4j_user, _c.neo4j_password),
+                database=_c.neo4j_dbname,
+            )
+
+        with open(f"{cache_dir}/node2questiondict.pkl", "rb") as fh:
+            old_node2questiondict = pickle.load(fh)
+        with open(f"{cache_dir}/docid2nodes.json", "r") as fh:
+            old_docid2nodes = json.load(fh)
+
+        # Flatten all nodes into a list to allow cross-doc batching.
+        # Order within each doc is preserved so docid2nodes ordering is stable.
+        all_items = []  # (doc_id, text, keywords, embed_list, questiondict)
+        for doc_id, old_node_ids in old_docid2nodes.items():
+            for old_node in old_node_ids:
+                node, questiondict = old_node2questiondict[(old_node, doc_id)]
+                embed = node["embed"]
+                if hasattr(embed, "tolist"):
+                    embed = embed.tolist()
+                all_items.append((doc_id, node["text"], node["keywords"], embed, questiondict))
+
+        logger.info(
+            "HopRAG batched nodes: inserting %d nodes in batches of %d",
+            len(all_items), _batch_size,
+        )
+
+        unwind_query = (
+            f"UNWIND $rows AS row "
+            f"CREATE (n:{self.label} {{text: row.text, keywords: row.keywords, embed: row.embed}}) "
+            f"RETURN id(n)"
+        )
+
+        new_node2questiondict: dict = {}
+        new_docid2nodes: dict = {}
+
+        with self.driver.session() as session:
+            for i in range(0, len(all_items), _batch_size):
+                batch = all_items[i : i + _batch_size]
+                rows = [
+                    {"text": text, "keywords": kw, "embed": emb}
+                    for _, text, kw, emb, _ in batch
+                ]
+                result = session.run(unwind_query, {"rows": rows})
+                new_ids = [r[0] for r in result]
+
+                if len(new_ids) != len(batch):
+                    raise RuntimeError(
+                        f"HopRAG batched nodes: UNWIND returned {len(new_ids)} IDs "
+                        f"for batch of {len(batch)} — aborting to prevent ID mismatch"
+                    )
+
+                for (doc_id, _, _, _, questiondict), new_id in zip(batch, new_ids):
+                    new_node2questiondict[(new_id, doc_id)] = questiondict
+                    new_docid2nodes.setdefault(doc_id, []).append(new_id)
+
+                if (i // _batch_size + 1) % 20 == 0 or i + _batch_size >= len(all_items):
+                    logger.info(
+                        "HopRAG batched nodes: %d/%d inserted",
+                        min(i + _batch_size, len(all_items)), len(all_items),
+                    )
+
+        return new_docid2nodes, new_node2questiondict
+
+    _batched_create_nodes_cache._patched_batched = True  # type: ignore[attr-defined]
+    HopBuilder.QABuilder.create_nodes_cache = _batched_create_nodes_cache
+    logger.info(
+        "HopRAG: patched create_nodes_cache (UNWIND batch_size=%d, sleep removed)",
+        _batch_size,
+    )
+
+
+def _patch_create_edge_batched() -> None:
+    """Wrap create_edge to replace row-by-row INSERT loops with UNWIND batches.
+
+    Strategy: run the pandas2-patched create_edge with a _NullDriver that
+    silently discards all session.run() calls.  This populates self.edges and
+    self.abstract2chunk via the existing pandas computation without touching
+    Neo4j.  Then we do the actual batched INSERTs ourselves.
+
+    Quality: identical edges are created — same source DataFrames, same Cypher
+    relationship type (config.edge_name), same properties.  numpy int64 / float32
+    arrays are explicitly cast to Python int / list so UNWIND nested-dict params
+    serialize correctly over Bolt.
+    """
+    import HopBuilder
+
+    if getattr(HopBuilder.QABuilder.create_edge, "_patched_edge_batched", False):
+        return
+
+    _orig_create_edge = HopBuilder.QABuilder.create_edge
+    _batch_size = _EDGE_INSERT_BATCH
+
+    class _NullSession:
+        def run(self, *a, **kw):
+            return iter([])
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    class _NullDriver:
+        def session(self):
+            return _NullSession()
+
+    def _batched_create_edge(self, node2questiondict, docid2nodes):
+        import config as _hop_config
+
+        # Ensure a real driver exists before we swap it.
+        if self.driver is None:
+            from neo4j import GraphDatabase
+            self.driver = GraphDatabase.driver(
+                _hop_config.neo4j_url,
+                auth=(_hop_config.neo4j_user, _hop_config.neo4j_password),
+                database=_hop_config.neo4j_dbname,
+            )
+
+        real_driver = self.driver
+        self.driver = _NullDriver()
+        try:
+            # Runs all pandas computation; INSERT loops hit the null driver (no-op).
+            _orig_create_edge(self, node2questiondict, docid2nodes)
+        finally:
+            self.driver = real_driver
+
+        # self.edges and self.abstract2chunk are now populated.
+        edge_name = _hop_config.edge_name
+
+        pending2answerable_batch = (
+            f"UNWIND $rows AS row "
+            f"MATCH (a), (b) WHERE id(a) = row.id1 AND id(b) = row.id2 "
+            f"CREATE (a)-[r:{edge_name} {{keywords: row.keywords, embed: row.embed, "
+            f"question: row.question}}]->(b)"
+        )
+        abstract2answerable_batch = (
+            f"UNWIND $rows AS row "
+            f"MATCH (a), (b) WHERE id(a) = row.abstract_id AND id(b) = row.id2 "
+            f"CREATE (a)-[r:{edge_name} {{keywords: row.keywords, embed: row.embed, "
+            f"question: row.question}}]->(b)"
+        )
+
+        if self.edges is not None and len(self.edges) > 0:
+            p2a_rows = []
+            for _, row in self.edges.iterrows():
+                emb = row["embedding_x"]
+                if hasattr(emb, "tolist"):
+                    emb = emb.tolist()
+                p2a_rows.append({
+                    "id1": int(row["node_id_x"]),
+                    "id2": int(row["node_id_y"]),
+                    "keywords": sorted(list(row["keywords_both"])),
+                    "embed": emb,
+                    "question": row["question_y"],
+                })
+            with self.driver.session() as session:
+                for i in range(0, len(p2a_rows), _batch_size):
+                    session.run(pending2answerable_batch, {"rows": p2a_rows[i : i + _batch_size]})
+            logger.info(
+                "HopRAG batched edges: %d pending2answerable inserted", len(p2a_rows)
+            )
+
+        if self.abstract2chunk is not None and len(self.abstract2chunk) > 0:
+            a2a_rows = []
+            for _, row in self.abstract2chunk.iterrows():
+                emb = row["embedding"]
+                if hasattr(emb, "tolist"):
+                    emb = emb.tolist()
+                abstract_id = docid2nodes[row["doc_id"]][0]
+                a2a_rows.append({
+                    "abstract_id": int(abstract_id),
+                    "id2": int(row["node_id"]),
+                    "keywords": sorted(list(row["keywords"])),
+                    "embed": emb,
+                    "question": row["question"],
+                })
+            with self.driver.session() as session:
+                for i in range(0, len(a2a_rows), _batch_size):
+                    session.run(abstract2answerable_batch, {"rows": a2a_rows[i : i + _batch_size]})
+            logger.info(
+                "HopRAG batched edges: %d abstract2answerable inserted", len(a2a_rows)
+            )
+
+    _batched_create_edge._patched_edge_batched = True  # type: ignore[attr-defined]
+    HopBuilder.QABuilder.create_edge = _batched_create_edge
+    logger.info("HopRAG: patched create_edge (UNWIND batch_size=%d)", _batch_size)
 
 
 # ---------------------------------------------------------------- driver

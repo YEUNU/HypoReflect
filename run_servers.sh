@@ -178,14 +178,15 @@ start_gen() {
     fi
 
     echo "Starting Generation Server (Port 28000)..."
-    # GPU 1 layout: gen 0.40 + rerank 0.40 = 0.80 (~25.6 GiB / 32 GiB target).
-    # max-len reduced to 16384 (indexing prompts fit easily; 32K wasted KV).
+    # GPU 1 layout: gen 0.46 + rerank 0.30 = 0.76 (~24.9 GiB / 32 GiB target).
+    # max-len 32768: HopRAG indexing sends 12K+ input tokens + 4096 output;
+    # 16384 limit (12288 usable input) caused 400 errors on most documents.
     CUDA_VISIBLE_DEVICES=1 nohup .venv/bin/vllm serve Qwen/Qwen3-4B-Instruct-2507 \
         --served-model-name generation-model \
         --host 0.0.0.0 \
         --port 28000 \
-        --gpu-memory-utilization 0.40 \
-        --max-model-len 16384 \
+        --gpu-memory-utilization 0.46 \
+        --max-model-len 32768 \
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_xml \
         --attention-backend FLASHINFER \
@@ -209,7 +210,7 @@ start_gen2() {
         --host 0.0.0.0 \
         --port 28010 \
         --gpu-memory-utilization 0.50 \
-        --max-model-len 16384 \
+        --max-model-len 32768 \
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_xml \
         --attention-backend FLASHINFER \

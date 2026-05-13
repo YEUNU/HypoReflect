@@ -810,7 +810,13 @@ class EntitySupport:
                 if not fail_open:
                     return []
             return filtered
-        return nodes if fail_open else []
+        # Entity filter is the company anchor. When the query has explicit
+        # entity candidates and zero nodes match, returning all candidates
+        # under `fail_open=True` lets cross-company chunks into the ledger
+        # (observed on AWW vs 3M contamination). Period mismatch is already
+        # tolerated by the inner `period_filtered` branch under fail_open;
+        # entity mismatch must stay hard.
+        return []
 
     def _build_entity_retry_entities(self, query_state: dict[str, Any], user_query: str) -> list[str]:
         entity_candidates = self._query_entity_candidates(query_state, user_query)

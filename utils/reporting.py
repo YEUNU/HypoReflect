@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Any
 
-from utils.io import _safe_float, _safe_int, _to_markdown_table, _write_json, _write_jsonl
+from utils.io import _safe_float, _safe_int, _write_json, _write_jsonl
 
 
 def _collect_trace_steps(trace: Any) -> list[str]:
@@ -134,96 +134,6 @@ def _compute_stage_diagnostics(details: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _build_model_summary_markdown(summary: dict[str, Any], result_filename: str) -> str:
-    avg_fields = [key for key in sorted(summary.keys()) if key.startswith("avg_")]
-    metric_rows: list[list[Any]] = []
-    for key in avg_fields:
-        value = summary.get(key)
-        if isinstance(value, (int, float)):
-            metric_rows.append([key, f"{float(value):.4f}"])
-    metric_table = _to_markdown_table(["metric", "value"], metric_rows) if metric_rows else "_No numeric metrics_"
-
-    cat_rows: list[list[Any]] = []
-    cat_summaries = summary.get("category_summaries", {})
-    if isinstance(cat_summaries, dict):
-        for cat, cat_info in sorted(cat_summaries.items()):
-            if not isinstance(cat_info, dict):
-                continue
-            cat_rows.append([
-                cat,
-                cat_info.get("count", 0),
-                f"{_safe_float(cat_info.get('avg_llm_judge_score', 0.0)):.4f}",
-                f"{_safe_float(cat_info.get('avg_hallucination', 0.0)):.4f}",
-                f"{_safe_float(cat_info.get('avg_answer_attempted', 0.0)):.4f}",
-                f"{_safe_float(cat_info.get('avg_doc_match', 0.0)):.4f}",
-                f"{_safe_float(cat_info.get('avg_page_match', 0.0)):.4f}",
-                f"{_safe_float(cat_info.get('avg_latency', 0.0)):.4f}",
-            ])
-    cat_table = _to_markdown_table(
-        [
-            "category",
-            "count",
-            "avg_llm_judge_score",
-            "avg_hallucination",
-            "avg_answer_attempted",
-            "avg_doc_match",
-            "avg_page_match",
-            "avg_latency",
-        ],
-        cat_rows,
-    ) if cat_rows else "_No category rows_"
-
-    lines = [
-        f"# Benchmark Summary: {result_filename}",
-        "",
-        f"- strategy: `{summary.get('strategy', '')}`",
-        f"- corpus_tag: `{summary.get('corpus_tag', '')}`",
-        f"- dataset: `{summary.get('dataset', '')}`",
-        f"- status: `{summary.get('status', '')}`",
-        f"- queries_count: `{summary.get('queries_count', 0)}` / `{summary.get('total_queries', 0)}`",
-        "",
-        "## Overall Metrics",
-        "",
-        metric_table,
-        "",
-        "## Category Breakdown",
-        "",
-        cat_table,
-    ]
-    return "\n".join(lines) + "\n"
-
-
-def _build_stage_diagnostics_markdown(diag: dict[str, Any], result_filename: str) -> str:
-    rows = [
-        ["queries", _safe_int(diag.get("queries", 0))],
-        ["answer_attempt_count", _safe_int(diag.get("answer_attempt_count", 0))],
-        ["answer_attempt_rate", f"{_safe_float(diag.get('answer_attempt_rate', 0.0)):.4f}"],
-        ["hallucination_count", _safe_int(diag.get("hallucination_count", 0))],
-        ["hallucination_rate", f"{_safe_float(diag.get('hallucination_rate', 0.0)):.4f}"],
-        ["hallucination_eligible_count", _safe_int(diag.get("hallucination_eligible_count", 0))],
-        ["hallucination_rate_answered", f"{_safe_float(diag.get('hallucination_rate_answered', 0.0)):.4f}"],
-        ["insufficient_count", _safe_int(diag.get("insufficient_count", 0))],
-        ["insufficient_rate", f"{_safe_float(diag.get('insufficient_rate', 0.0)):.4f}"],
-        ["forced_synthesis_count", _safe_int(diag.get("forced_synthesis_count", 0))],
-        ["forced_synthesis_rate", f"{_safe_float(diag.get('forced_synthesis_rate', 0.0)):.4f}"],
-        ["compute_missing_guard_count", _safe_int(diag.get("compute_missing_guard_count", 0))],
-        ["compute_missing_guard_rate", f"{_safe_float(diag.get('compute_missing_guard_rate', 0.0)):.4f}"],
-        ["reflection_count", _safe_int(diag.get("reflection_count", 0))],
-        ["reflection_rate", f"{_safe_float(diag.get('reflection_rate', 0.0)):.4f}"],
-        ["refinement_count", _safe_int(diag.get("refinement_count", 0))],
-        ["refinement_rate", f"{_safe_float(diag.get('refinement_rate', 0.0)):.4f}"],
-        ["avg_reflection_attempts", f"{_safe_float(diag.get('avg_reflection_attempts', 0.0)):.4f}"],
-        ["avg_refinement_attempts", f"{_safe_float(diag.get('avg_refinement_attempts', 0.0)):.4f}"],
-        ["avg_synthesis_attempts", f"{_safe_float(diag.get('avg_synthesis_attempts', 0.0)):.4f}"],
-    ]
-    return "\n".join([
-        f"# Stage Diagnostics: {result_filename}",
-        "",
-        _to_markdown_table(["metric", "value"], rows),
-        "",
-    ])
-
-
 def _build_failure_records(details: list[dict[str, Any]], top_k: int = 30) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     for idx, item in enumerate(details, start=1):
@@ -255,33 +165,23 @@ def _build_failure_records(details: list[dict[str, Any]], top_k: int = 30) -> li
     return failures[: max(1, top_k)]
 
 
-def _build_failures_markdown(records: list[dict[str, Any]], result_filename: str) -> str:
-    rows = []
-    for idx, record in enumerate(records, start=1):
-        rows.append([
-            idx,
-            f"{_safe_float(record.get('llm_judge_score', 0.0)):.1f}",
-            f"{_safe_float(record.get('hallucination', 0.0)):.1f}",
-            f"{_safe_float(record.get('doc_match', 0.0)):.1f}",
-            f"{_safe_float(record.get('page_match', 0.0)):.1f}",
-            record.get("category", ""),
-            record.get("query", ""),
-            record.get("llm_judge_reason", ""),
-            record.get("hallucination_reason", ""),
-        ])
-    table = _to_markdown_table(
-        ["rank", "judge", "hallu", "doc", "page", "category", "query", "judge_reason", "hallu_reason"],
-        rows,
-    ) if rows else "_No failures_"
-    return "\n".join([
-        f"# Failures Top-K: {result_filename}",
-        "",
-        table,
-        "",
-    ])
-
-
 def _write_model_report_artifacts(summary: dict[str, Any], result_file: Path) -> None:
+    """Write secondary report artifacts alongside the main result JSON.
+
+    Layout (2026-05 cleanup — markdown renderings removed, traces split):
+      <stem>.json                   — main result (details now WITHOUT
+                                      interaction_trace; trace_steps count
+                                      kept as a compact summary)
+      <stem>.summary.json           — main minus details (quick metadata)
+      <stem>.details.jsonl          — one detail per line (no full trace)
+      <stem>.traces.jsonl           — per-query interaction_trace, one per
+                                      line; join key = idx
+      <stem>.failures_topk.jsonl    — bottom 30 by judge score
+      <stem>.stage_diagnostics.json — execution-stage call rates
+
+    Markdown variants (.summary.md / .failures_topk.md / .stage_diagnostics.md)
+    are no longer generated — derived from JSON on demand.
+    """
     details = summary.get("details", [])
     if not isinstance(details, list):
         details = []
@@ -290,18 +190,17 @@ def _write_model_report_artifacts(summary: dict[str, Any], result_file: Path) ->
     overview = {key: value for key, value in summary.items() if key != "details"}
 
     summary_json_file = result_file.with_name(f"{stem}.summary.json")
-    summary_md_file = result_file.with_name(f"{stem}.summary.md")
     details_jsonl_file = result_file.with_name(f"{stem}.details.jsonl")
+    traces_jsonl_file = result_file.with_name(f"{stem}.traces.jsonl")
     failures_jsonl_file = result_file.with_name(f"{stem}.failures_topk.jsonl")
-    failures_md_file = result_file.with_name(f"{stem}.failures_topk.md")
     stage_diag_json_file = result_file.with_name(f"{stem}.stage_diagnostics.json")
-    stage_diag_md_file = result_file.with_name(f"{stem}.stage_diagnostics.md")
 
     _write_json(summary_json_file, overview)
-    summary_md_file.write_text(_build_model_summary_markdown(summary, result_file.name), encoding="utf-8")
 
     detail_rows: list[dict[str, Any]] = []
+    trace_rows: list[dict[str, Any]] = []
     for idx, item in enumerate(details, start=1):
+        trace = item.get("interaction_trace", [])
         detail_rows.append({
             "idx": idx,
             "query": item.get("query", ""),
@@ -319,17 +218,18 @@ def _write_model_report_artifacts(summary: dict[str, Any], result_file: Path) ->
             "page_match": _safe_float(item.get("page_match", 0.0)),
             "latency": _safe_float(item.get("latency", 0.0)),
             "error": item.get("error", ""),
-            "trace_steps": _collect_trace_steps(item.get("interaction_trace", [])),
+            "trace_steps": _collect_trace_steps(trace),
+        })
+        trace_rows.append({
+            "idx": idx,
+            "query": item.get("query", ""),
+            "interaction_trace": trace,
         })
     _write_jsonl(details_jsonl_file, detail_rows)
+    _write_jsonl(traces_jsonl_file, trace_rows)
 
     failures = _build_failure_records(details, top_k=30)
     _write_jsonl(failures_jsonl_file, failures)
-    failures_md_file.write_text(_build_failures_markdown(failures, result_file.name), encoding="utf-8")
 
     diagnostics = _compute_stage_diagnostics(details)
     _write_json(stage_diag_json_file, diagnostics)
-    stage_diag_md_file.write_text(
-        _build_stage_diagnostics_markdown(diagnostics, result_file.name),
-        encoding="utf-8",
-    )

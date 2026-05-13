@@ -16,6 +16,7 @@ from models.hyporeflect.stages.common import (
     NUMERIC_METRIC_KEYS,
     NUMERIC_QUERY_MARKERS,
     answer_matches_calc_result,
+    format_retrieved_chunks,
     missing_data_policy,
 )
 from models.hyporeflect.stages.llm_json import compact_json, generate_json_with_retries
@@ -50,6 +51,9 @@ class ReflectionHandler:
     def __init__(self, llm, stage_model: str = ""):
         self.llm = llm
         self.stage_model = stage_model or RAGConfig.REFLECTION_MODEL
+
+    def effective_model(self) -> str:
+        return self.stage_model or getattr(self.llm, "model_name", "") or RAGConfig.DEFAULT_MODEL
 
     @staticmethod
     def _reflection_prompt() -> str:
@@ -211,6 +215,9 @@ class ReflectionHandler:
                         max_chars=2000,
                     ),
                     context=state.context,
+                    retrieved_chunks=format_retrieved_chunks(
+                        getattr(state, "all_context_data", []),
+                    ),
                     draft_answer=state.final_answer,
                 ),
             },
@@ -322,6 +329,7 @@ class ReflectionHandler:
                 "meta": state.reflection_meta,
                 "accepted": ok,
                 "attempts": attempts,
+                "model": self.effective_model(),
             },
             duration_ms=(time.perf_counter() - started) * 1000.0,
         )

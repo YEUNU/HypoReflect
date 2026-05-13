@@ -12,6 +12,27 @@ from typing import List, Dict, Any, Optional
 from utils.parsers import clean_and_unwrap_json
 from .config import RAGConfig
 
+def _filter_live_bases(bases: list) -> list:
+    """Return only the bases whose /health endpoint responds 200.
+    Falls back to the full list if none are reachable (e.g. all servers down)."""
+    import urllib.request
+    live = []
+    for base in bases:
+        health_url = base.rstrip("/").removesuffix("v1").rstrip("/") + "/health"
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            live.append(base)
+        except Exception:
+            pass
+    if not live:
+        logging.getLogger(__name__).warning(
+            "No live gen endpoints detected; falling back to all configured: %s", bases
+        )
+        return list(bases)
+    logging.getLogger(__name__).info("Live gen endpoints: %s", live)
+    return live
+
+
 class VLLMClient:
     _client_cache = {}
     # Round-robin counter shared across all VLLMClient instances. Single-threaded
@@ -39,7 +60,7 @@ class VLLMClient:
         # All available generation endpoints (VLLM_URL + optional VLLM_URL_2);
         # the `client` property round-robins across these on every access so a
         # second vllm serve process on a separate GPU shares the LLM load.
-        self.vllm_urls = list(RAGConfig.VLLM_URLS) or [RAGConfig.VLLM_URL]
+        self.vllm_urls = _filter_live_bases(list(RAGConfig.VLLM_URLS) or [RAGConfig.VLLM_URL])
         self.ocr_url = RAGConfig.VLLM_OCR_URL
         self.embed_url = RAGConfig.VLLM_EMBED_URL
         self.rerank_url = RAGConfig.VLLM_RERANK_URL

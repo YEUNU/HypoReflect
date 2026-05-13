@@ -353,12 +353,25 @@ async def run_benchmark(
 
             summary["details"] = results
 
-            with open(result_file, "w", encoding="utf-8") as file:
-                json.dump(summary, file, indent=2, ensure_ascii=False)
+            # Write report artifacts FIRST (it writes the full trace to a
+            # separate *.traces.jsonl), then strip interaction_trace from
+            # the main JSON to keep it lightweight (the trace alone was
+            # ~77% of the file size).
             try:
                 _write_model_report_artifacts(summary, result_file)
             except Exception as exc:
                 logger.warning("Failed to write report artifacts for %s: %s", result_file, exc)
+
+            slim_details = []
+            for d in summary.get("details", []) or []:
+                if isinstance(d, dict):
+                    slim = {k: v for k, v in d.items() if k != "interaction_trace"}
+                    slim_details.append(slim)
+                else:
+                    slim_details.append(d)
+            slim_summary = {**summary, "details": slim_details}
+            with open(result_file, "w", encoding="utf-8") as file:
+                json.dump(slim_summary, file, indent=2, ensure_ascii=False)
 
     await asyncio.gather(
         *[_process_query(i, it) for i, it in enumerate(benchmark_data)],

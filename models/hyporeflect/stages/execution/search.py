@@ -251,13 +251,17 @@ class SearchSupport:
             loop_state.consecutive_no_progress = 0
 
     # Regex for inline EVIDENCE lines emitted by the agent LLM alongside its
-    # tool_call. Tolerant of partial output: lines that fail the pattern
-    # are silently skipped.
+    # tool_call. Tolerant variations:
+    #   - "value=" prefix optional (4B Qwen often omits it)
+    #   - value can be a long sentence (use [^|] greedy to first separator)
+    #   - citation/metric require explicit "=" prefix (less ambiguous)
+    # Lines that fail the pattern are silently skipped.
     _INLINE_EVIDENCE_RE = re.compile(
         r'EVIDENCE\s*:\s*'
-        r'value\s*=\s*(?P<value>.+?)\s*\|\s*'
-        r'citation\s*=\s*(?P<citation>\[\[.+?\]\])\s*\|\s*'
-        r'metric\s*=\s*(?P<metric>.+?)\s*(?:$|\n)',
+        r'(?:value\s*=\s*)?'
+        r'(?P<value>[^|]+?)\s*\|\s*'
+        r'citation\s*=\s*(?P<citation>\[\[[^\]]+?\]\])\s*\|\s*'
+        r'metric\s*=\s*(?P<metric>[^\n|]+?)\s*(?:$|\n)',
         re.IGNORECASE,
     )
 

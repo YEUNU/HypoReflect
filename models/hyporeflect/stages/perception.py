@@ -23,6 +23,9 @@ class PerceptionHandler:
         self.llm = llm
         self.stage_model = stage_model or RAGConfig.PERCEPTION_MODEL
 
+    def effective_model(self) -> str:
+        return self.stage_model or getattr(self.llm, "model_name", "") or RAGConfig.DEFAULT_MODEL
+
     @staticmethod
     def _validate_perception_json(data: dict[str, Any]) -> tuple[bool, str]:
         complexity = str(data.get("complexity", "") or "").strip().lower()
@@ -73,6 +76,7 @@ class PerceptionHandler:
                 "reason": "schema_validation_failed",
                 "attempts": attempts,
             }
+        parsed_output["model"] = self.effective_model()
         append_trace(
             state.trace,
             step="perception",
