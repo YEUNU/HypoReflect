@@ -152,7 +152,13 @@ class _VLLMEmbedClient:
         self.model = model
         self.dim = dim
         import requests
+        from requests.adapters import HTTPAdapter
         self._sess = requests.Session()
+        # Default pool_maxsize=10 overflows when DOC_WORKERS × CHUNK_THREADS > 10.
+        # Set to 128 to avoid "Connection pool is full" warnings under parallel load.
+        _adapter = HTTPAdapter(pool_maxsize=128, pool_connections=16)
+        self._sess.mount("http://", _adapter)
+        self._sess.mount("https://", _adapter)
 
     def encode(self, documents, normalize_embeddings: bool = True, device=None):
         _ = normalize_embeddings, device
@@ -237,11 +243,11 @@ def _install_round_robin_patch(config) -> None:
     tool.OpenAI = _RoundRobinOpenAI
 
     # Cap max_tokens and truncate input to stay within the 32768 context window.
-    # HopRAG JSON outputs (Title + Question List) verified at 25-410 tokens;
-    # 512 cap is safe. Max input budget: 32768 - 512 = 32256 tokens.
-    # Character-based truncation (~3.5 chars/token) handles edge cases where
-    # even 32256-token budget is exceeded by extremely long 10-K documents.
-    _MAX_OUTPUT = 512
+    # Observed truncations at col 1782-2516 (~510-720 tokens) on full-corpus
+    # 10-K documents: Question List output exceeds 512 for dense paragraphs.
+    # Raised to 1024 to eliminate JSONDecodeError "Unterminated string" retries.
+    # Input budget: 32768 - 1024 = 31744 tokens (~111K chars) — still sufficient.
+    _MAX_OUTPUT = 1024
     _MAX_MODEL_LEN = 32768
     _MAX_INPUT_CHARS = int((_MAX_MODEL_LEN - _MAX_OUTPUT) * 3.5)  # ~111K chars
 
