@@ -242,15 +242,14 @@ def _install_round_robin_patch(config) -> None:
     # our subclass while preserving every other part of _get_chat_completion.
     tool.OpenAI = _RoundRobinOpenAI
 
-    # Cap max_tokens and truncate input to stay within the 32768 context window.
-    # Observed truncations at col 3309-5013 on full-corpus 10-K documents:
-    # financial text averages ~4.5 chars/token (vs generic 3.5), so 1024 tokens
-    # ≈ 4600 chars — still too short for verbose Question Lists.
-    # 2048 tokens ≈ 9200 chars covers the longest observed outputs.
-    # Input budget: 32768 - 2048 = 30720 tokens — sufficient for all 10-K chunks.
-    _MAX_OUTPUT = 2048
+    # Cap max_tokens and truncate input per LLM call.
+    # Root cause of "Unterminated string" errors: per-chunk input was unbounded,
+    # so the model generated question lists longer than _MAX_OUTPUT.
+    # Fix: cap input to 6000 chars (~1700 tokens) → output stays well under 512t.
+    # At ~1700 input tokens, a question list runs ~200-400 output tokens.
+    _MAX_OUTPUT = 512
     _MAX_MODEL_LEN = 32768
-    _MAX_INPUT_CHARS = int((_MAX_MODEL_LEN - _MAX_OUTPUT) * 3.5)  # ~111K chars
+    _MAX_INPUT_CHARS = 6000  # chars — tight cap on each LLM call's user message
 
     _orig_get_chat_completion = tool._get_chat_completion
 
