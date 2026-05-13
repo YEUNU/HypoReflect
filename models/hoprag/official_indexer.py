@@ -550,17 +550,32 @@ def _patch_create_nodes_offline_parallel() -> None:
         per_doc_dir.mkdir(parents=True, exist_ok=True)
 
         # Load per-doc caches from any previous partial run.
+        # Only load the node-ID list (.ids companion) to avoid pulling ~168MB of
+        # embedding/question data per doc into RAM at startup (54GB for 324 docs).
         docid2nodes: dict = {}
-        node2questiondict: dict = {}
+        node2questiondict: dict = {}  # kept empty — Stage 2 streams per-doc pkls
         cached_doc_ids: set = set()
 
         for pkl_file in sorted(per_doc_dir.glob("*.pkl")):
-            doc_id = pkl_file.stem  # "APPLE_2018_10K.txt" (stem strips last ".pkl")
+            doc_id = pkl_file.stem
+            ids_file = per_doc_dir / (doc_id + ".ids")
+            if ids_file.exists():
+                try:
+                    with open(ids_file) as fh:
+                        local_nodes = json.load(fh)
+                    docid2nodes[doc_id] = local_nodes
+                    cached_doc_ids.add(doc_id)
+                    continue
+                except Exception:
+                    pass  # fall through to pkl read below
+            # No .ids companion yet (pkl from an older run): load pkl once,
+            # write the .ids file, then discard the heavy question/embed data.
             try:
                 with open(pkl_file, "rb") as fh:
-                    local_nodes, local_n2q = pickle.load(fh)
+                    local_nodes, _local_n2q = pickle.load(fh)
+                with open(ids_file, "w") as fh:
+                    json.dump(local_nodes, fh)
                 docid2nodes[doc_id] = local_nodes
-                node2questiondict.update(local_n2q)
                 cached_doc_ids.add(doc_id)
             except Exception as exc:
                 logger.warning(
@@ -610,10 +625,18 @@ def _patch_create_nodes_offline_parallel() -> None:
 
                 # Atomic write: tmp → rename so a crash during write leaves no partial file.
                 cache_file = per_doc_dir / (doc_id + ".pkl")
-                tmp_file = cache_file.with_suffix(".tmp")
+                tmp_file = per_doc_dir / (doc_id + ".pkl.tmp")
                 with open(tmp_file, "wb") as fh:
                     pickle.dump((local_nodes, local_n2q), fh)
                 tmp_file.rename(cache_file)
+
+                # Write lightweight .ids companion (just the node-ID list) so
+                # future restarts skip loading the full ~168MB pkl at startup.
+                ids_file = per_doc_dir / (doc_id + ".ids")
+                ids_tmp = per_doc_dir / (doc_id + ".ids.tmp")
+                with open(ids_tmp, "w") as fh:
+                    json.dump(local_nodes, fh)
+                ids_tmp.rename(ids_file)
 
                 return doc_id, local_nodes, local_n2q
             except Exception as exc:
@@ -630,16 +653,17 @@ def _patch_create_nodes_offline_parallel() -> None:
             for fut in _tqdm(
                 _as_completed(futures), total=len(futures), desc="create_nodes_parallel"
             ):
-                doc_id, nodes, n2q = fut.result()
+                doc_id, nodes, _n2q = fut.result()
                 if nodes is not None:
                     docid2nodes[doc_id] = nodes
-                    node2questiondict.update(n2q)
+                    # _n2q intentionally NOT accumulated — per-doc pkls hold the
+                    # data; Stage 2 streams them company-by-company to avoid OOM.
 
         logger.info(
             "HopRAG parallel node build complete: %d docs total (%d processed + %d cached)",
             len(docid2nodes), len(docs_to_process), len(cached_doc_ids),
         )
-        return docid2nodes, node2questiondict
+        return docid2nodes, {}  # empty — Stage 2 streams per-doc pkls
 
     _parallel_create_nodes_offline._patched_parallel = True  # type: ignore[attr-defined]
     HopBuilder.QABuilder.create_nodes_offline = _parallel_create_nodes_offline
@@ -873,6 +897,127 @@ def _group_files_by_company(file_to_company: dict[str, str]) -> dict[str, list[s
     return groups
 
 
+def _run_stage2_company_streaming(
+    builder,
+    per_doc_dir: Path,
+    file_to_company: dict[str, str],
+    config,
+) -> None:
+    """Insert nodes + build edges one company at a time to avoid OOM.
+
+    Peak memory: one company's embedding data (~30-100 MB) instead of all
+    324 docs at once (~54 GB).  Source of truth: per-doc pkls in per_doc_dir.
+    """
+    import gc
+    import pickle
+
+    if builder.driver is None:
+        from neo4j import GraphDatabase
+        builder.driver = GraphDatabase.driver(
+            config.neo4j_url,
+            auth=(config.neo4j_user, config.neo4j_password),
+            database=config.neo4j_dbname,
+        )
+
+    unwind_insert = (
+        f"UNWIND $rows AS row "
+        f"CREATE (n:{builder.label} {{text: row.text, keywords: row.keywords, "
+        f"embed: row.embed}}) "
+        f"RETURN id(n)"
+    )
+    backfill_cypher = (
+        "UNWIND $rows AS row MATCH (n) WHERE id(n) = row.id "
+        "SET n.source = row.source, n.company = row.company"
+    )
+
+    groups = _group_files_by_company(file_to_company)
+    total_nodes = 0
+
+    for company, doc_list in groups.items():
+        company_n2q: dict = {}
+        company_docid2nodes: dict = {}
+        backfill_pairs: list = []
+
+        for doc_id in sorted(doc_list):
+            pkl_file = per_doc_dir / (doc_id + ".pkl")
+            if not pkl_file.exists():
+                logger.warning("HopRAG streaming: missing pkl for %s, skipping", doc_id)
+                continue
+            try:
+                with open(pkl_file, "rb") as fh:
+                    _local_nodes, local_n2q = pickle.load(fh)
+            except Exception as exc:
+                logger.warning("HopRAG streaming: corrupt pkl for %s: %s", doc_id, exc)
+                continue
+
+            rows: list = []
+            key_order: list = []
+            for (_fake_id, did), (node, questiondict) in local_n2q.items():
+                embed = node["embed"]
+                if hasattr(embed, "tolist"):
+                    embed = embed.tolist()
+                rows.append({
+                    "text": node["text"],
+                    "keywords": node["keywords"],
+                    "embed": embed,
+                })
+                key_order.append((did, questiondict))
+
+            if not rows:
+                del local_n2q, rows, key_order
+                gc.collect()
+                continue
+
+            real_ids: list = []
+            with builder.driver.session() as session:
+                for i in range(0, len(rows), _NODE_INSERT_BATCH):
+                    batch = rows[i : i + _NODE_INSERT_BATCH]
+                    result = session.run(unwind_insert, {"rows": batch})
+                    batch_ids = [r[0] for r in result]
+                    if len(batch_ids) != len(batch):
+                        raise RuntimeError(
+                            f"HopRAG streaming: UNWIND returned {len(batch_ids)} IDs "
+                            f"for batch of {len(batch)} — aborting"
+                        )
+                    real_ids.extend(batch_ids)
+
+            stem = Path(doc_id).stem
+            comp = file_to_company.get(doc_id, "_unknown")
+            for (did, questiondict), real_id in zip(key_order, real_ids):
+                company_n2q[(real_id, did)] = questiondict
+                company_docid2nodes.setdefault(did, []).append(real_id)
+                backfill_pairs.append({"id": int(real_id), "source": stem, "company": comp})
+
+            total_nodes += len(real_ids)
+            del local_n2q, rows, key_order, real_ids
+            gc.collect()
+
+        if not company_docid2nodes:
+            continue
+
+        if backfill_pairs:
+            with builder.driver.session() as s:
+                for i in range(0, len(backfill_pairs), _NODE_INSERT_BATCH):
+                    s.run(backfill_cypher, {"rows": backfill_pairs[i : i + _NODE_INSERT_BATCH]})
+
+        if company_n2q:
+            try:
+                builder.create_edge(company_n2q, company_docid2nodes)
+                logger.info(
+                    "HopRAG streaming: edges for company=%s (%d docs, %d nodes)",
+                    company, len(company_docid2nodes), len(backfill_pairs),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "HopRAG streaming: edge build failed company=%s: %s", company, exc
+                )
+
+        del company_n2q, company_docid2nodes, backfill_pairs
+        gc.collect()
+
+    logger.info("HopRAG streaming Stage 2 complete: %d total nodes inserted", total_nodes)
+
+
 def _run_official_index_blocking(
     dataset_path: str,
     corpus_tag: str,
@@ -910,74 +1055,19 @@ def _run_official_index_blocking(
         offline=True,
     )
 
-    # Stage 2: insert nodes into Neo4j (assigning real node IDs) + edges +
-    # indices, grouped by company (FinanceBench is company-anchored — cross-
-    # company edges add noise per CLAUDE.md hyporeflect §3.1.4).
-    docid2nodes_path = cache_dir / "docid2nodes.json"
-    node2q_path = cache_dir / "node2questiondict.pkl"
-    if not (docid2nodes_path.exists() and node2q_path.exists()):
-        logger.error("HopRAG: stage-1 cache missing, cannot build edges")
+    # Stage 2: insert nodes + build edges, streamed one company at a time.
+    # Avoids loading all 324 docs × ~168 MB = ~54 GB into RAM at once.
+    per_doc_dir = cache_dir / "docs"
+    if not per_doc_dir.exists() or not any(per_doc_dir.glob("*.pkl")):
+        logger.error(
+            "HopRAG: per-doc pkl cache missing at %s — cannot build edges. "
+            "Re-run Stage 1 (run_index.sh --model hoprag).",
+            per_doc_dir,
+        )
         return
 
     builder = HopBuilder.QABuilder(done=set(), label=config.node_name)
-
-    # create_nodes_cache reads cache pickle (which has (node_dict, q_dict)
-    # tuples) and writes nodes to Neo4j, returning the dict-only form
-    # (new_node2questiondict) that create_edge expects.
-    new_docid2nodes, new_node2q = builder.create_nodes_cache(str(cache_dir))
-    logger.info(
-        "HopRAG: inserted %d nodes across %d docs into Neo4j (label=%s)",
-        sum(len(v) for v in new_docid2nodes.values()), len(new_docid2nodes),
-        config.node_name,
-    )
-
-    # HopRAG-native schema (text/keywords/embed) drops doc provenance, which
-    # breaks the bench's doc_match metric. Backfill `source` (filename stem
-    # = financebench doc_name) and `company` per node so retrieval results
-    # carry the same provenance as hyporeflect/ms_graphrag baselines.
-    if builder.driver is None:
-        from neo4j import GraphDatabase
-        builder.driver = GraphDatabase.driver(
-            config.neo4j_url,
-            auth=(config.neo4j_user, config.neo4j_password),
-            database=config.neo4j_dbname,
-        )
-    backfill_pairs = []
-    for doc_id, node_ids in new_docid2nodes.items():
-        stem = Path(doc_id).stem
-        company = file_to_company.get(doc_id, "_unknown")
-        for nid in node_ids:
-            backfill_pairs.append({"id": int(nid), "source": stem, "company": company})
-    if backfill_pairs:
-        with builder.driver.session() as s:
-            s.run(
-                "UNWIND $rows AS row MATCH (n) WHERE id(n) = row.id "
-                "SET n.source = row.source, n.company = row.company",
-                {"rows": backfill_pairs},
-            )
-        logger.info("HopRAG: backfilled source/company on %d nodes", len(backfill_pairs))
-
-    groups = _group_files_by_company(file_to_company)
-    logger.info("HopRAG: building edges per-company over %d groups", len(groups))
-
-    for company, doc_list in groups.items():
-        docs_in_group = [d for d in doc_list if d in new_docid2nodes]
-        if not docs_in_group:
-            continue
-        sub_docid2nodes = {d: new_docid2nodes[d] for d in docs_in_group}
-        sub_node2q = {
-            (nid, did): new_node2q[(nid, did)]
-            for did in docs_in_group
-            for nid in new_docid2nodes[did]
-            if (nid, did) in new_node2q
-        }
-        if not sub_node2q:
-            continue
-        try:
-            builder.create_edge(sub_node2q, sub_docid2nodes)
-            logger.info("  edges built for company=%s (%d docs)", company, len(docs_in_group))
-        except Exception as e:
-            logger.warning("  edge build failed for company=%s: %s", company, e)
+    _run_stage2_company_streaming(builder, per_doc_dir, file_to_company, config)
 
     # Stage 3: vector + fulltext indices.
     builder.create_index()
