@@ -243,11 +243,12 @@ def _install_round_robin_patch(config) -> None:
     tool.OpenAI = _RoundRobinOpenAI
 
     # Cap max_tokens and truncate input to stay within the 32768 context window.
-    # Observed truncations at col 1782-2516 (~510-720 tokens) on full-corpus
-    # 10-K documents: Question List output exceeds 512 for dense paragraphs.
-    # Raised to 1024 to eliminate JSONDecodeError "Unterminated string" retries.
-    # Input budget: 32768 - 1024 = 31744 tokens (~111K chars) — still sufficient.
-    _MAX_OUTPUT = 1024
+    # Observed truncations at col 3309-5013 on full-corpus 10-K documents:
+    # financial text averages ~4.5 chars/token (vs generic 3.5), so 1024 tokens
+    # ≈ 4600 chars — still too short for verbose Question Lists.
+    # 2048 tokens ≈ 9200 chars covers the longest observed outputs.
+    # Input budget: 32768 - 2048 = 30720 tokens — sufficient for all 10-K chunks.
+    _MAX_OUTPUT = 2048
     _MAX_MODEL_LEN = 32768
     _MAX_INPUT_CHARS = int((_MAX_MODEL_LEN - _MAX_OUTPUT) * 3.5)  # ~111K chars
 
