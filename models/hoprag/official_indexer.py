@@ -275,6 +275,27 @@ def _install_round_robin_patch(config) -> None:
 
     tool._get_chat_completion = _capped_get_chat_completion
 
+    # Patch txt2obj to fix a bug where `.replace('\\"', '"')` corrupts valid
+    # JSON before parsing. Root cause: vLLM json_object mode returns properly
+    # escaped JSON (e.g. "term \"N/M\""), but txt2obj unescapes \" → " before
+    # json.loads, producing unbalanced quotes → JSONDecodeError → returns None.
+    # Fix: try json.loads directly first (handles all standard JSON escapes),
+    # and only fall back to the original clean_json_str path if that fails.
+    _orig_txt2obj = tool.txt2obj
+
+    def _safe_txt2obj(text):
+        if not text:
+            return _orig_txt2obj(text)
+        # Fast path: vLLM json_object guarantees valid JSON — parse directly.
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        # Slow path: original clean_json_str logic for non-standard responses.
+        return _orig_txt2obj(text)
+
+    tool.txt2obj = _safe_txt2obj
+
     logger.info(
         "HopRAG: round-robin OpenAI patch + max_tokens cap installed "
         "across %d endpoints: %s",
@@ -596,7 +617,11 @@ def _patch_create_nodes_offline_parallel() -> None:
 
                 return doc_id, local_nodes, local_n2q
             except Exception as exc:
-                logger.warning("HopRAG parallel: error on %s: %s", doc_id, exc)
+                import traceback as _tb
+                logger.warning(
+                    "HopRAG parallel: error on %s: %s\n%s",
+                    doc_id, exc, _tb.format_exc(),
+                )
                 _time.sleep(1)
                 return doc_id, None, None
 
