@@ -245,11 +245,11 @@ def _install_round_robin_patch(config) -> None:
     # Cap max_tokens and truncate input per LLM call.
     # Root cause of "Unterminated string" errors: per-chunk input was unbounded,
     # so the model generated question lists longer than _MAX_OUTPUT.
-    # Fix: cap input to 6000 chars (~1700 tokens) → output stays well under 512t.
-    # At ~1700 input tokens, a question list runs ~200-400 output tokens.
+    # Fix: cap input to 3000 chars (~667 tokens) → question list ~10 items ~250t
+    # output, well under the 512t budget. Financial text runs ~4.5 chars/token.
     _MAX_OUTPUT = 512
     _MAX_MODEL_LEN = 32768
-    _MAX_INPUT_CHARS = 6000  # chars — tight cap on each LLM call's user message
+    _MAX_INPUT_CHARS = 3000  # chars — tight cap on each LLM call's user message
 
     _orig_get_chat_completion = tool._get_chat_completion
 
