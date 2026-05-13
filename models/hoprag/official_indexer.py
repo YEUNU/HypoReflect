@@ -419,6 +419,29 @@ def _setup_hoprag_modules(corpus_tag: str) -> None:
     # sparse_similarity in HopBuilder.create_edge.
     tool.get_ner_eng = _spacy_ner_eng
 
+    # Fix: try_run() returns (None, None, None) on failure, but get_question_list
+    # callers unpack only 2 values → ValueError: too many values to unpack.
+    # Root cause: tool.try_run hardcodes a 3-tuple on exhausted retries, but
+    # _get_chat_completion with keys=["Question List"] normally returns 2 values.
+    # Patch get_question_list directly so LLM failure yields an empty list instead.
+    _orig_get_question_list = tool.get_question_list
+
+    def _safe_get_question_list(extract_template, sentences, query_generator):
+        result = tool.get_chat_completion(
+            [{"role": "user", "content": extract_template.format(sentences=sentences)}],
+            keys=["Question List"],
+            model=query_generator,
+            max_tokens=4096,
+        )
+        if not isinstance(result, (tuple, list)) or len(result) != 2:
+            return []
+        question_list, _ = result
+        return question_list or []
+
+    tool.get_question_list = _safe_get_question_list
+    import HopBuilder as _HB_tmp
+    _HB_tmp.get_question_list = _safe_get_question_list
+
     _patch_hopbuilder_for_pandas2()
     _patch_create_nodes_offline_parallel()
     _patch_create_nodes_cache_batched()
@@ -778,6 +801,174 @@ def _patch_create_nodes_cache_batched() -> None:
     )
 
 
+_EDGE_CHUNKED_THRESHOLD = int(os.environ.get("RAG_HOP_EDGE_CHUNK_THRESHOLD", "400"))
+_EDGE_TOP_K = int(os.environ.get("RAG_HOP_EDGE_TOP_K", "30"))
+_EDGE_CHUNK_SIZE = int(os.environ.get("RAG_HOP_EDGE_CHUNK_SIZE", "1000"))
+
+
+def _edges_via_chunked_topk(
+    node2questiondict: dict,
+    docid2nodes: dict,
+    top_k: int = _EDGE_TOP_K,
+    chunk_size: int = _EDGE_CHUNK_SIZE,
+):
+    """Memory-safe replacement for HopBuilder.create_edge's O(N²) cross join.
+
+    The original code calls pending_df.merge(answerable_df, how='cross') which
+    materialises N_pending × N_answerable rows — for 3M's 14K nodes that's
+    ~140K × 28K = 3.9B rows = ~31 GB OOM.
+
+    This function instead:
+    1. Computes cosine similarities in chunks of `chunk_size` pending questions.
+    2. Keeps only the top-`top_k` answerable candidates per pending question.
+    3. Builds a compact edge-candidate DataFrame (~N_p × top_k rows).
+    4. Applies the same selection logic as create_edge:
+       cartesian1 (best per pending, intra+cross) + cartesian2 (top-2 cross-doc).
+
+    Returns (edges_df, abstract2chunk_df) with the same column schemas as
+    self.edges / self.abstract2chunk after create_edge runs.
+    """
+    import pandas as pd
+
+    data: list = []
+    for (node_id, doc_id), qdict in node2questiondict.items():
+        for question_label, tuplelist in qdict.items():
+            for qi, tup in enumerate(tuplelist):
+                question, keywords, emb = tup
+                data.append({
+                    "doc_id": doc_id,
+                    "node_id": node_id,
+                    "question_label": question_label,
+                    "question_id": qi,
+                    "embedding": np.asarray(emb, dtype=np.float32),
+                    "question": question,
+                    "keywords": keywords,
+                })
+
+    if not data:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    del data
+
+    answerable_df = df[df["question_label"] == "answerable"].reset_index(drop=True)
+    pending_df = df[df["question_label"] == "pending"].reset_index(drop=True)
+    del df
+
+    if len(answerable_df) == 0 or len(pending_df) == 0:
+        return pd.DataFrame(), answerable_df
+
+    # Stack embeddings into 2-D float32 arrays for chunked matmul.
+    pending_emb = np.stack(pending_df["embedding"].values).astype(np.float32)   # (N_p, dim)
+    answerable_emb = np.stack(answerable_df["embedding"].values).astype(np.float32)  # (N_a, dim)
+
+    actual_k = min(top_k, len(answerable_df))
+    best_a_idx = np.empty((len(pending_df), actual_k), dtype=np.int32)
+    best_a_scores = np.empty((len(pending_df), actual_k), dtype=np.float32)
+
+    for i in range(0, len(pending_df), chunk_size):
+        chunk = pending_emb[i : i + chunk_size]            # (C, dim)
+        sims = (chunk @ answerable_emb.T).astype(np.float32)  # (C, N_a)
+        if actual_k < sims.shape[1]:
+            idx = np.argpartition(sims, -actual_k, axis=1)[:, -actual_k:]
+        else:
+            idx = np.tile(np.arange(sims.shape[1]), (sims.shape[0], 1))
+        scores = np.take_along_axis(sims, idx, axis=1)
+        best_a_idx[i : i + chunk_size] = idx
+        best_a_scores[i : i + chunk_size] = scores
+        del sims, idx, scores
+
+    del pending_emb, answerable_emb
+
+    # Pre-extract arrays for fast row-level access (avoids repeated .iloc[pi]).
+    p_nids = pending_df["node_id"].values
+    p_dids = pending_df["doc_id"].values
+    p_qs = pending_df["question"].values
+    p_kws = pending_df["keywords"].values
+    p_embs = pending_df["embedding"].values
+
+    a_nids = answerable_df["node_id"].values
+    a_dids = answerable_df["doc_id"].values
+    a_qs = answerable_df["question"].values
+    a_kws = answerable_df["keywords"].values
+
+    edge_rows: list = []
+    for pi in range(len(pending_df)):
+        p_nid = p_nids[pi]
+        p_did = p_dids[pi]
+        for rank in range(actual_k):
+            ai = int(best_a_idx[pi, rank])
+            a_nid = a_nids[ai]
+            if a_nid == p_nid:
+                continue  # no self-loops
+            p_kw: set = p_kws[pi]
+            a_kw: set = a_kws[ai]
+            union_kw = (p_kw | a_kw) if (p_kw or a_kw) else set()
+            inter_kw = p_kw & a_kw
+            sparse_sim = len(inter_kw) / len(union_kw) if union_kw else 0.0
+            edge_rows.append({
+                "node_id_x": int(p_nid),
+                "node_id_y": int(a_nid),
+                "doc_id_x": p_did,
+                "doc_id_y": a_dids[ai],
+                "question_x": p_qs[pi],
+                "question_y": a_qs[ai],
+                "keywords_both": union_kw,
+                "embedding_x": p_embs[pi],
+                "similarity": float(best_a_scores[pi, rank]) + sparse_sim,
+            })
+
+    del best_a_idx, best_a_scores
+
+    if not edge_rows:
+        return pd.DataFrame(), answerable_df
+
+    cartesian = pd.DataFrame(edge_rows)
+    del edge_rows
+
+    max_edges = 1_000_000_000
+    inner_ratio = 1 / 4
+
+    # cartesian1: best answerable per pending question (intra + cross doc).
+    idx1 = cartesian.groupby("question_x")["similarity"].idxmax()
+    cartesian1 = cartesian.loc[idx1].sort_values("similarity", ascending=False).drop_duplicates(
+        subset=["node_id_x", "node_id_y"], keep="first"
+    )
+
+    # cartesian2: cross-doc only, top-2 per pending question.
+    cartesian2 = cartesian[cartesian["doc_id_x"] != cartesian["doc_id_y"]].copy()
+    del cartesian
+    cartesian2 = (
+        cartesian2.sort_values(["question_x", "similarity"], ascending=[True, False])
+        .groupby("question_x").head(2)
+        .sort_values("similarity", ascending=False)
+        .drop_duplicates(subset=["node_id_x", "node_id_y"], keep="first")
+    )
+    trimmed = cartesian2.iloc[max_edges:]
+    cartesian2 = cartesian2.iloc[:max_edges]
+    if len(trimmed) > 0:
+        trimmed = trimmed[~trimmed["node_id_x"].isin(cartesian2["node_id_x"])].groupby("node_id_x").head(1)
+        cartesian2 = pd.concat([cartesian2, trimmed], ignore_index=True)
+    del trimmed
+
+    cartesian1 = cartesian1.iloc[: int(max_edges * inner_ratio)]
+    cartesian2 = cartesian2.iloc[: int(max_edges * (1 - inner_ratio))]
+
+    cols = ["node_id_x", "question_y", "keywords_both", "embedding_x", "node_id_y", "similarity"]
+    edges_df = pd.concat(
+        [cartesian1[cols], cartesian2[cols]], ignore_index=True
+    ).drop_duplicates(subset=["node_id_x", "node_id_y"], keep="first")
+
+    used_q = set(cartesian1["question_y"].tolist()) | set(cartesian2["question_y"].tolist())
+    abstract2chunk_df = answerable_df[~answerable_df["question"].isin(used_q)]
+
+    logger.info(
+        "HopRAG chunked edges: %d edges, %d abstract2chunk (top_k=%d, chunk=%d)",
+        len(edges_df), len(abstract2chunk_df), top_k, chunk_size,
+    )
+    return edges_df, abstract2chunk_df
+
+
 def _patch_create_edge_batched() -> None:
     """Wrap create_edge to replace row-by-row INSERT loops with UNWIND batches.
 
@@ -824,12 +1015,19 @@ def _patch_create_edge_batched() -> None:
             )
 
         real_driver = self.driver
-        self.driver = _NullDriver()
-        try:
-            # Runs all pandas computation; INSERT loops hit the null driver (no-op).
-            _orig_create_edge(self, node2questiondict, docid2nodes)
-        finally:
-            self.driver = real_driver
+
+        if len(node2questiondict) > _EDGE_CHUNKED_THRESHOLD:
+            # Large company: avoid O(N²) cross join OOM with chunked top-K.
+            self.edges, self.abstract2chunk = _edges_via_chunked_topk(
+                node2questiondict, docid2nodes
+            )
+        else:
+            self.driver = _NullDriver()
+            try:
+                # Runs all pandas computation; INSERT loops hit the null driver (no-op).
+                _orig_create_edge(self, node2questiondict, docid2nodes)
+            finally:
+                self.driver = real_driver
 
         # self.edges and self.abstract2chunk are now populated.
         edge_name = _hop_config.edge_name
@@ -936,82 +1134,185 @@ def _run_stage2_company_streaming(
     )
 
     groups = _group_files_by_company(file_to_company)
+
+    # Resume support: load tracking sets from cache dir sibling of per_doc_dir.
+    cache_dir = per_doc_dir.parent
+    nodes_done_path = cache_dir / "stage2_nodes_done.pkl"
+    edges_done_path = cache_dir / "stage2_edges_done.pkl"
+
+    nodes_done: set = set()
+    edges_done: set = set()
+    if nodes_done_path.exists():
+        with open(nodes_done_path, "rb") as fh:
+            nodes_done = pickle.load(fh)
+    if edges_done_path.exists():
+        with open(edges_done_path, "rb") as fh:
+            edges_done = pickle.load(fh)
+
+    # Detect companies that already have nodes from a prior partial run (e.g. 3M
+    # after the OOM kill). Querying by n.company allows resuming node insertion
+    # without creating duplicates; the company_n2q is rebuilt from per-doc pkls
+    # using the real Neo4j IDs fetched from the existing nodes.
+    existing_by_company: dict[str, list] = {}
+    with builder.driver.session() as s:
+        res = s.run(
+            f"MATCH (n:{builder.label}) WHERE n.company IS NOT NULL "
+            f"RETURN n.company AS company, collect(id(n)) AS ids"
+        )
+        for rec in res:
+            existing_by_company[rec["company"]] = rec["ids"]
+
+    if existing_by_company:
+        logger.info(
+            "HopRAG streaming: %d companies already have nodes (partial resume): %s",
+            len(existing_by_company), sorted(existing_by_company.keys()),
+        )
+
     total_nodes = 0
 
     for company, doc_list in groups.items():
+        if company in edges_done:
+            logger.info("HopRAG streaming: skip company=%s (edges already done)", company)
+            continue
+
         company_n2q: dict = {}
         company_docid2nodes: dict = {}
         backfill_pairs: list = []
 
-        for doc_id in sorted(doc_list):
-            pkl_file = per_doc_dir / (doc_id + ".pkl")
-            if not pkl_file.exists():
-                logger.warning("HopRAG streaming: missing pkl for %s, skipping", doc_id)
-                continue
-            try:
-                with open(pkl_file, "rb") as fh:
-                    _local_nodes, local_n2q = pickle.load(fh)
-            except Exception as exc:
-                logger.warning("HopRAG streaming: corrupt pkl for %s: %s", doc_id, exc)
-                continue
+        if company in nodes_done or company in existing_by_company:
+            # Nodes already in Neo4j — rebuild company_n2q by querying Neo4j per-doc.
+            # Neo4j auto-increments node IDs, so ORDER BY id(n) matches insertion order,
+            # which matches local_n2q.items() dict order (Python 3.7+ insertion order).
+            logger.info(
+                "HopRAG streaming: company=%s nodes already inserted — rebuilding n2q from Neo4j+pkl",
+                company,
+            )
+            per_doc_id_query = (
+                f"MATCH (n:{builder.label}) WHERE n.source = $stem "
+                f"RETURN id(n) AS nid ORDER BY id(n)"
+            )
+            rebuild_ok = True
+            for doc_id in sorted(doc_list):
+                stem = Path(doc_id).stem
+                pkl_file = per_doc_dir / (doc_id + ".pkl")
+                if not pkl_file.exists():
+                    logger.warning("HopRAG streaming resume: missing pkl for %s, skipping company", doc_id)
+                    rebuild_ok = False
+                    break
+                try:
+                    with open(pkl_file, "rb") as fh:
+                        _local_nodes, local_n2q = pickle.load(fh)
+                except Exception as exc:
+                    logger.warning("HopRAG streaming resume: corrupt pkl %s: %s", doc_id, exc)
+                    rebuild_ok = False
+                    break
 
-            rows: list = []
-            key_order: list = []
-            for (_fake_id, did), (node, questiondict) in local_n2q.items():
-                embed = node["embed"]
-                if hasattr(embed, "tolist"):
-                    embed = embed.tolist()
-                rows.append({
-                    "text": node["text"],
-                    "keywords": node["keywords"],
-                    "embed": embed,
-                })
-                key_order.append((did, questiondict))
+                with builder.driver.session() as s:
+                    existing_ids = [r["nid"] for r in s.run(per_doc_id_query, {"stem": stem})]
 
-            if not rows:
-                del local_n2q, rows, key_order
+                if len(existing_ids) != len(local_n2q):
+                    logger.warning(
+                        "HopRAG streaming resume: doc %s Neo4j count %d != pkl count %d — skipping company",
+                        doc_id, len(existing_ids), len(local_n2q),
+                    )
+                    rebuild_ok = False
+                    break
+
+                for real_id, ((_fake_id, did), (_node, questiondict)) in zip(
+                    existing_ids, local_n2q.items()
+                ):
+                    company_n2q[(real_id, did)] = questiondict
+                    company_docid2nodes.setdefault(did, []).append(real_id)
+                del local_n2q
+                gc.collect()
+
+            if not rebuild_ok or not company_n2q:
+                logger.warning(
+                    "HopRAG streaming: could not rebuild n2q for company=%s — skipping edges", company
+                )
+                del company_n2q, company_docid2nodes, backfill_pairs
                 gc.collect()
                 continue
 
-            real_ids: list = []
-            with builder.driver.session() as session:
-                for i in range(0, len(rows), _NODE_INSERT_BATCH):
-                    batch = rows[i : i + _NODE_INSERT_BATCH]
-                    result = session.run(unwind_insert, {"rows": batch})
-                    batch_ids = [r[0] for r in result]
-                    if len(batch_ids) != len(batch):
-                        raise RuntimeError(
-                            f"HopRAG streaming: UNWIND returned {len(batch_ids)} IDs "
-                            f"for batch of {len(batch)} — aborting"
-                        )
-                    real_ids.extend(batch_ids)
+        else:
+            # Normal path: insert nodes for this company.
+            for doc_id in sorted(doc_list):
+                pkl_file = per_doc_dir / (doc_id + ".pkl")
+                if not pkl_file.exists():
+                    logger.warning("HopRAG streaming: missing pkl for %s, skipping", doc_id)
+                    continue
+                try:
+                    with open(pkl_file, "rb") as fh:
+                        _local_nodes, local_n2q = pickle.load(fh)
+                except Exception as exc:
+                    logger.warning("HopRAG streaming: corrupt pkl for %s: %s", doc_id, exc)
+                    continue
 
-            stem = Path(doc_id).stem
-            comp = file_to_company.get(doc_id, "_unknown")
-            for (did, questiondict), real_id in zip(key_order, real_ids):
-                company_n2q[(real_id, did)] = questiondict
-                company_docid2nodes.setdefault(did, []).append(real_id)
-                backfill_pairs.append({"id": int(real_id), "source": stem, "company": comp})
+                rows: list = []
+                key_order: list = []
+                for (_fake_id, did), (node, questiondict) in local_n2q.items():
+                    embed = node["embed"]
+                    if hasattr(embed, "tolist"):
+                        embed = embed.tolist()
+                    rows.append({
+                        "text": node["text"],
+                        "keywords": node["keywords"],
+                        "embed": embed,
+                    })
+                    key_order.append((did, questiondict))
 
-            total_nodes += len(real_ids)
-            del local_n2q, rows, key_order, real_ids
-            gc.collect()
+                if not rows:
+                    del local_n2q, rows, key_order
+                    gc.collect()
+                    continue
 
-        if not company_docid2nodes:
-            continue
+                real_ids: list = []
+                with builder.driver.session() as session:
+                    for i in range(0, len(rows), _NODE_INSERT_BATCH):
+                        batch = rows[i : i + _NODE_INSERT_BATCH]
+                        result = session.run(unwind_insert, {"rows": batch})
+                        batch_ids = [r[0] for r in result]
+                        if len(batch_ids) != len(batch):
+                            raise RuntimeError(
+                                f"HopRAG streaming: UNWIND returned {len(batch_ids)} IDs "
+                                f"for batch of {len(batch)} — aborting"
+                            )
+                        real_ids.extend(batch_ids)
 
-        if backfill_pairs:
-            with builder.driver.session() as s:
-                for i in range(0, len(backfill_pairs), _NODE_INSERT_BATCH):
-                    s.run(backfill_cypher, {"rows": backfill_pairs[i : i + _NODE_INSERT_BATCH]})
+                stem = Path(doc_id).stem
+                comp = file_to_company.get(doc_id, "_unknown")
+                for (did, questiondict), real_id in zip(key_order, real_ids):
+                    company_n2q[(real_id, did)] = questiondict
+                    company_docid2nodes.setdefault(did, []).append(real_id)
+                    backfill_pairs.append({"id": int(real_id), "source": stem, "company": comp})
+
+                total_nodes += len(real_ids)
+                del local_n2q, rows, key_order, real_ids
+                gc.collect()
+
+            if not company_docid2nodes:
+                continue
+
+            if backfill_pairs:
+                with builder.driver.session() as s:
+                    for i in range(0, len(backfill_pairs), _NODE_INSERT_BATCH):
+                        s.run(backfill_cypher, {"rows": backfill_pairs[i : i + _NODE_INSERT_BATCH]})
+
+            # Persist nodes_done immediately so a crash mid-edge won't re-insert nodes.
+            nodes_done.add(company)
+            with open(nodes_done_path, "wb") as fh:
+                pickle.dump(nodes_done, fh)
 
         if company_n2q:
             try:
                 builder.create_edge(company_n2q, company_docid2nodes)
                 logger.info(
                     "HopRAG streaming: edges for company=%s (%d docs, %d nodes)",
-                    company, len(company_docid2nodes), len(backfill_pairs),
+                    company, len(company_docid2nodes), len(company_n2q),
                 )
+                edges_done.add(company)
+                with open(edges_done_path, "wb") as fh:
+                    pickle.dump(edges_done, fh)
             except Exception as exc:
                 logger.warning(
                     "HopRAG streaming: edge build failed company=%s: %s", company, exc
