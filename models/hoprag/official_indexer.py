@@ -517,23 +517,55 @@ def _patch_create_nodes_offline_parallel() -> None:
 
     def _parallel_create_nodes_offline(self, docs_dir, start_index=0, span=100):
         import os
+        import pickle
         import time as _time
+        from pathlib import Path
 
         docs_pool = sorted(os.listdir(docs_dir))
+
+        # Per-doc cache dir: sibling of _input/, stores one .pkl per completed doc.
+        # Survives process crashes — restart resumes from last saved doc.
+        per_doc_dir = Path(docs_dir).parent / "_cache" / "docs"
+        per_doc_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load per-doc caches from any previous partial run.
+        docid2nodes: dict = {}
+        node2questiondict: dict = {}
+        cached_doc_ids: set = set()
+
+        for pkl_file in sorted(per_doc_dir.glob("*.pkl")):
+            doc_id = pkl_file.stem  # "APPLE_2018_10K.txt" (stem strips last ".pkl")
+            try:
+                with open(pkl_file, "rb") as fh:
+                    local_nodes, local_n2q = pickle.load(fh)
+                docid2nodes[doc_id] = local_nodes
+                node2questiondict.update(local_n2q)
+                cached_doc_ids.add(doc_id)
+            except Exception as exc:
+                logger.warning(
+                    "HopRAG parallel: corrupt per-doc cache %s, will reprocess: %s",
+                    pkl_file.name, exc,
+                )
+                pkl_file.unlink(missing_ok=True)
+
+        # Skip docs already in the main cache (self.done) OR per-doc cache.
         docs_to_process = [
             d for d in docs_pool[start_index : start_index + span]
-            if d not in self.done
+            if d not in self.done and d not in cached_doc_ids
         ]
+
         import config as _cfg
         logger.info(
-            "HopRAG parallel node build: %d docs, doc_workers=%d, chunk_threads=%d",
-            len(docs_to_process), _doc_workers, _cfg.max_thread_num,
+            "HopRAG parallel node build: %d to process, %d from per-doc cache, "
+            "%d in main cache | doc_workers=%d chunk_threads=%d",
+            len(docs_to_process), len(cached_doc_ids), len(self.done),
+            _doc_workers, _cfg.max_thread_num,
         )
 
         _id_lock = threading.Lock()
-        _counter = [start_index * 50]
-        docid2nodes: dict = {}
-        node2questiondict: dict = {}
+        # Start counter above any IDs already assigned in cached docs to avoid collisions.
+        max_cached_id = max((max(v) for v in docid2nodes.values() if v), default=0)
+        _counter = [max(start_index * 50, max_cached_id)]
 
         def _process_one(doc_id):
             doc_path = os.path.join(docs_dir, doc_id)
@@ -554,6 +586,14 @@ def _patch_create_nodes_offline_parallel() -> None:
                         node_id = _counter[0]
                     local_n2q[(node_id, doc_id)] = (node, tup[3])
                     local_nodes.append(node_id)
+
+                # Atomic write: tmp → rename so a crash during write leaves no partial file.
+                cache_file = per_doc_dir / (doc_id + ".pkl")
+                tmp_file = cache_file.with_suffix(".tmp")
+                with open(tmp_file, "wb") as fh:
+                    pickle.dump((local_nodes, local_n2q), fh)
+                tmp_file.rename(cache_file)
+
                 return doc_id, local_nodes, local_n2q
             except Exception as exc:
                 logger.warning("HopRAG parallel: error on %s: %s", doc_id, exc)
@@ -570,6 +610,10 @@ def _patch_create_nodes_offline_parallel() -> None:
                     docid2nodes[doc_id] = nodes
                     node2questiondict.update(n2q)
 
+        logger.info(
+            "HopRAG parallel node build complete: %d docs total (%d processed + %d cached)",
+            len(docid2nodes), len(docs_to_process), len(cached_doc_ids),
+        )
         return docid2nodes, node2questiondict
 
     _parallel_create_nodes_offline._patched_parallel = True  # type: ignore[attr-defined]
