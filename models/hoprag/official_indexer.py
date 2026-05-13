@@ -638,7 +638,12 @@ def _patch_create_nodes_offline_parallel() -> None:
                     json.dump(local_nodes, fh)
                 ids_tmp.rename(ids_file)
 
-                return doc_id, local_nodes, local_n2q
+                # Explicitly free before return: concurrent.futures caches the
+                # return value inside the Future object until the executor exits.
+                # Returning local_n2q (~30 MB/doc × 290 futures = ~8 GB) would
+                # accumulate in memory even though the main loop discards it.
+                del sentence2node, local_n2q
+                return doc_id, local_nodes, None
             except Exception as exc:
                 import traceback as _tb
                 logger.warning(
